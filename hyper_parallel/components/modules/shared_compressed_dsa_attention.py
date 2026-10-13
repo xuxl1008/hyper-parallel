@@ -43,11 +43,15 @@ from hyper_parallel.components.functional.sparse_flash_mla import (
 from hyper_parallel.components.functional.sparse_lightning_indexer_kl_loss_grad import (
     gather_selected_keys, sparse_lightning_indexer_kl_loss, validate_fused_kl_inputs,
 )
+from hyper_parallel.distributed.context_parallel.indexer_balance import resolve_indexer_balance_block_size
+from hyper_parallel.distributed.context_parallel.sequence_dispatch import (
+    SequenceDispatchRoute, document_prefix_route, sliding_window_route,
+)
 from hyper_parallel.models.replacement import module_replacement
 
 
 class SequenceGatherHandle(Protocol):
-    """Handle returned by an asynchronous sequence all-gather."""
+    """Handle returned by asynchronous differentiable bank communication."""
 
     def wait(self) -> torch.Tensor:
         """Wait for communication and return the differentiable result."""
@@ -81,6 +85,7 @@ class SharedCompressedAttentionState:
     index_key_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     topk_indices_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     candidate_blocks_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
+    compressed_kv_offsets: dict[int, int] = field(default_factory=dict)
 
     @staticmethod
     def _require(
@@ -97,9 +102,10 @@ class SharedCompressedAttentionState:
             )
         return values[source_layer]
 
-    def publish_compressed_kv(self, source_layer: int, value: torch.Tensor) -> None:
-        """Publish compressed K=V while preserving its autograd graph."""
+    def publish_compressed_kv(self, source_layer: int, value: torch.Tensor, key_offset: int = 0) -> None:
+        """Publish compressed K=V and its global origin, preserving the autograd graph."""
         self.compressed_kv_by_source[source_layer] = value
+        self.compressed_kv_offsets[source_layer] = key_offset
 
     def require_compressed_kv(self, source_layer: int | None, consumer_layer: int) -> torch.Tensor:
         """Read compressed K=V from the consumer's configured Full layer."""
@@ -167,18 +173,21 @@ class SharedCompressedIndexerOutput:
 
 @dataclass(frozen=True)
 class SharedCompressedAttentionCPContext:
-    """KV-all-gather context for shared compressed DSA.
+    """Communication for local queries and shared compressed banks.
 
-    Query-side tensors remain local sequence shards. Raw KV, compressed KV,
-    and index keys are gathered in CP-rank order. ``launch_sequence`` is
-    optional so numerical tests and non-overlapped backends can supply only a
-    differentiable synchronous gather.
+    ``launch_raw`` exchanges the same-document SWA halo when supplied.
+    Optional ``launch_main`` exchanges main KV document prefixes. Index K
+    retains differentiable all-gather independently of the main bank layout.
+    Contexts without ``launch_raw`` provide the full raw-bank reference.
     """
 
     size: int
     rank: int
     gather_sequence: Callable[[torch.Tensor, int], torch.Tensor]
     launch_sequence: Callable[[torch.Tensor, int], SequenceGatherHandle] | None = None
+    launch_raw: Callable[[torch.Tensor, int, SequenceDispatchRoute], SequenceGatherHandle] | None = None
+    balance_indexer: Callable[..., torch.Tensor] | None = None
+    launch_main: Callable[[torch.Tensor, int, SequenceDispatchRoute], SequenceGatherHandle] | None = None
 
     def launch(self, tensor: torch.Tensor, sequence_dim: int) -> SequenceGatherHandle:
         """Launch an async gather or create a deferred synchronous gather."""
@@ -282,11 +291,17 @@ class SharedCompressedPackedSequence:
             self._prepared_masks[device] = self.local_positions(device) == self.local_segment_starts(device)
         return self._prepared_masks[device]
 
+    def boundaries(self) -> tuple[int, ...]:
+        """Reuse the owned batch's host boundaries for routing across layers."""
+        if "boundaries" not in self._snapshot:
+            self._snapshot["boundaries"] = tuple(self.cu_seq_lens.detach().cpu().tolist())
+        return self._snapshot["boundaries"]
+
     def indexer_segments(self, ratio: int) -> tuple[tuple[int, int, int, int, int], ...]:
         """Describe packed Q intervals and completed K prefixes without per-layer synchronization."""
         if ratio not in self._indexer_segments:
             self.validate_compression_alignment(ratio)
-            boundaries = self.cu_seq_lens.detach().cpu().tolist()
+            boundaries = self.boundaries()
             local_start = self.local_query_start
             local_end = local_start + self.local_query_length
             segments = []
@@ -430,6 +445,25 @@ def _run_lightning_indexer(
     return lightning_indexer(query, key, merge_weight, compress_ratio, top_k, query_segments)
 
 
+def _causal_key_bounds(
+        query: torch.Tensor, ratio: int, query_offset: int,
+        minimum_key_indices: torch.Tensor | None, segments: tuple | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Derive visibility from original query positions after task redistribution."""
+    batch_size, length = query.shape[:2]
+    if segments is None:
+        positions = torch.arange(query_offset, query_offset + length, device=query.device)
+        return (positions + 1) // ratio, minimum_key_indices
+    upper = torch.empty(length, device=query.device, dtype=torch.long)
+    lower = torch.empty_like(upper)
+    for begin, end, key_start, key_end, residual in segments:
+        first = ratio * key_end + residual - (end - begin)
+        positions = torch.arange(first, first + end - begin, device=query.device)
+        upper[begin:end] = (positions + 1) // ratio
+        lower[begin:end] = key_start
+    return upper, lower.unsqueeze(0).expand(batch_size, -1)
+
+
 @torch.no_grad()
 def compressed_causal_topk(
         query: torch.Tensor,
@@ -493,6 +527,9 @@ def compressed_causal_topk(
 
     key_fp32 = key.float().transpose(1, 2).unsqueeze(1)
     key_positions = torch.arange(compressed_length, device=query.device).view(1, 1, -1)
+    upper_limits, minimum_key_indices = _causal_key_bounds(
+        query, compress_ratio, query_offset, minimum_key_indices, query_segments,
+    )
     selected_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
@@ -501,9 +538,7 @@ def compressed_causal_topk(
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)
-        visible = (
-            torch.arange(query_offset + start, query_offset + end, device=query.device) + 1
-        ) // compress_ratio
+        visible = upper_limits[start:end]
         scores.masked_fill_(key_positions >= visible.view(1, -1, 1), float("-inf"))
         if minimum_key_indices is not None:
             minimum = minimum_key_indices[:, start:end].unsqueeze(-1)
@@ -989,6 +1024,18 @@ class SharedCompressedDSAIndexer(nn.Module):
         self.query_chunk_size = int(getattr(module, "query_chunk_size", 256))
         self.train(module.training)
 
+    def _project_index_query(
+            self, query_residual: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project queries with their original rotary positions, including moved tasks."""
+        query = self.q_b_proj(query_residual.detach())
+        if query.shape[-1] % self.head_dim:
+            raise ValueError(
+                f"Indexer query width {query.shape[-1]} is not divisible by head_dim {self.head_dim}"
+            )
+        query = query.view(*query_residual.shape[:2], -1, self.head_dim)
+        return _apply_v41_rope(query.transpose(1, 2), cos, sin).transpose(1, 2)
+
     def _project_index_key(
             self,
             latent: torch.Tensor | None,
@@ -1026,21 +1073,15 @@ class SharedCompressedDSAIndexer(nn.Module):
             query_offset: int = 0,
             minimum_key_indices: torch.Tensor | None = None,
             query_segments: tuple[tuple[int, int, int, int, int], ...] | None = None,
+            document_lengths: tuple[int, ...] = (),
     ) -> SharedCompressedIndexerOutput:
         """Project local queries and score them against global compressed keys."""
-        batch_size, sequence_length, _ = hidden_states.shape
         cos, sin = compress_position_embeddings
 
         key, key_handle = self._project_index_key(latent, cos, sin, index_key, cp_context)
 
-        query = self.q_b_proj(query_residual.detach())
-        if query.shape[-1] % self.head_dim:
-            raise ValueError(
-                f"Indexer query width {query.shape[-1]} is not divisible by head_dim {self.head_dim}"
-            )
-        local_num_heads = query.shape[-1] // self.head_dim
-        query = query.view(batch_size, sequence_length, local_num_heads, self.head_dim)
-        query = _apply_v41_rope(query.transpose(1, 2), cos, sin).transpose(1, 2)
+        query = self._project_index_query(query_residual, cos, sin)
+        local_num_heads = query.shape[2]
         merge_weight = self.weights_proj(hidden_states.detach())
         if merge_weight.shape[-1] != local_num_heads:
             raise ValueError(
@@ -1051,10 +1092,29 @@ class SharedCompressedDSAIndexer(nn.Module):
         reduce_sum = None if tp_context is None else tp_context.reduce_sum
         if key_handle is not None:
             key = key_handle.wait()
-        topk_indices, candidate_blocks = self._select_indices(
-            query, key, merge_weight, candidate_blocks, query_offset,
-            reduce_sum, minimum_key_indices, query_segments,
-        )
+        if cp_context is not None and cp_context.balance_indexer is not None:
+            if tp_context is not None or self.is_candidate_source or self.uses_candidates:
+                raise NotImplementedError("Indexer load balance currently requires ordinary causal selection and TP=1")
+
+            def select_tasks(task_qr: torch.Tensor, task_weights: torch.Tensor,
+                             task_embeddings: tuple, segments: tuple) -> torch.Tensor:
+                """Project on the receiver while this layer's parameters are resident."""
+                task_query = self._project_index_query(task_qr, *task_embeddings)
+                return compressed_causal_topk(
+                    task_query, key, task_weights, compress_ratio=self.compress_ratio,
+                    sparse_count=self.index_topk, query_chunk_size=self.query_chunk_size,
+                    query_segments=segments, use_fused=self.use_fused,
+                )
+
+            topk_indices = cp_context.balance_indexer(
+                query_residual, merge_weight, (cos, sin), select_tasks, document_lengths, self.compress_ratio,
+            )
+            candidate_blocks = None
+        else:
+            topk_indices, candidate_blocks = self._select_indices(
+                query, key, merge_weight, candidate_blocks, query_offset,
+                reduce_sum, minimum_key_indices, query_segments,
+            )
         return SharedCompressedIndexerOutput(
             topk_indices=topk_indices,
             index_key=key,
@@ -1241,12 +1301,15 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             cos: torch.Tensor,
             sin: torch.Tensor,
             cp_context: SharedCompressedAttentionCPContext | None,
+            raw_route: SequenceDispatchRoute | None = None,
     ) -> tuple[torch.Tensor | None, SequenceGatherHandle | None]:
         """Project raw K=V and launch CP communication before query GEMMs."""
         key_value = self.kv_norm(self.kv_proj(hidden_states)).unsqueeze(1)
         key_value = _apply_v41_rope(key_value, cos, sin)
         if cp_context is None:
             return key_value, None
+        if raw_route is not None:
+            return None, cp_context.launch_raw(key_value, 2, raw_route)
         return None, cp_context.launch(key_value, 2)
 
     def _project_query(
@@ -1349,12 +1412,33 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_segments = packed_sequence.indexer_segments(ratio)
         return segment_starts, minimum_key_indices, query_segments
 
+    def _plan_bank_dispatch(
+            self, packed_sequence: SharedCompressedPackedSequence | None,
+            cp_context: SharedCompressedAttentionCPContext | None,
+            sequence_length: int, global_sequence_length: int, device: torch.device,
+    ) -> tuple[SequenceDispatchRoute | None, SequenceDispatchRoute | None, tuple[int, ...]]:
+        """Reuse document boundaries to route each bank in its own physical coordinates."""
+        boundaries = (0, global_sequence_length)
+        if packed_sequence is not None:
+            boundaries = packed_sequence.prepare(device, (self.compress_ratio,)).boundaries()
+        raw_route, main_route = None, None
+        if cp_context is not None and cp_context.launch_raw is not None:
+            raw_route = sliding_window_route(
+                boundaries, sequence_length, cp_context.size, cp_context.rank, self.sliding_window,
+            )
+        if self.compress_ratio and cp_context is not None and cp_context.launch_main is not None:
+            main_route = document_prefix_route(
+                boundaries, sequence_length, cp_context.size, cp_context.rank, self.compress_ratio,
+            )
+        return raw_route, main_route, tuple(end - start for start, end in zip(boundaries, boundaries[1:]))
+
     def _compute_compressed_kv(
             self,
             hidden_states: torch.Tensor,
             position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
             shared_state: "SharedCompressedAttentionState",
             cp_context: "SharedCompressedAttentionCPContext | None",
+            main_route: SequenceDispatchRoute | None = None,
     ) -> tuple[torch.Tensor | None, "SequenceGatherHandle | None"]:
         """Compress local hidden states and publish or launch the compressed KV."""
         latent = None
@@ -1363,6 +1447,8 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             latent, compressed = self.compressor(hidden_states, position_embeddings["compress"])
             if cp_context is None:
                 shared_state.publish_compressed_kv(self.layer_idx, compressed)
+            elif main_route is not None:
+                compressed_handle = cp_context.launch_main(compressed, 1, main_route)
             else:
                 compressed_handle = cp_context.launch(compressed, 1)
         return latent, compressed_handle
@@ -1379,6 +1465,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_offset: int,
             minimum_key_indices: torch.Tensor | None,
             query_segments: tuple,
+            document_lengths: tuple[int, ...],
     ) -> Any | None:
         """Run the indexer on index-source layers and publish its outputs."""
         if not self.is_index_source:
@@ -1407,6 +1494,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_offset=query_offset,
             minimum_key_indices=minimum_key_indices,
             query_segments=query_segments,
+            document_lengths=document_lengths,
         )
         if self.indexer.owns_key:
             shared_state.publish_index_key(self.layer_idx, indexer_output.index_key)
@@ -1427,6 +1515,8 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_offset: int,
             global_sequence_length: int,
             segment_starts: torch.Tensor | None,
+            raw_key_offset: int = 0,
+            main_key_offset: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Assemble dense-reference banks only after reference dispatch is selected."""
         window = build_sliding_window_indices(
@@ -1435,10 +1525,13 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         )
         if segment_starts is not None:
             window.masked_fill_(window < segment_starts.unsqueeze(-1), -1)
+        window = torch.where(window >= 0, window - raw_key_offset, -1)
         if compressed_kv is None:
             return key_value, window
         combined_key_value = torch.cat((key_value, compressed_kv.unsqueeze(1)), dim=2)
-        compressed_indices = torch.where(topk_indices >= 0, topk_indices.long() + global_sequence_length, -1)
+        compressed_indices = torch.where(
+            topk_indices >= 0, topk_indices.long() - main_key_offset + key_value.shape[2], -1,
+        )
         return combined_key_value, torch.cat((window, compressed_indices), dim=-1)
 
     def _apply_indexer_loss(
@@ -1448,6 +1541,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             compressed_kv: torch.Tensor | None,
             tp_context: "SharedCompressedAttentionTPContext | None",
             query_segments: tuple,
+            main_key_offset: int = 0,
     ) -> torch.Tensor:
         """Auto-scale the query by the indexer KL loss when configured."""
         if (
@@ -1456,13 +1550,23 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 and self.indexer.loss_coeff
                 and compressed_kv is not None
         ):
+            # KL uses the original owner's queries. A view aligns its student K
+            # with the compact teacher bank while preserving global Index K gradients.
+            index_key = indexer_output.index_key
+            if main_key_offset or compressed_kv.shape[1] != index_key.shape[1]:
+                index_key = index_key[:, main_key_offset:main_key_offset+compressed_kv.shape[1]]
+            selected = indexer_output.topk_indices
+            if main_key_offset:
+                selected = torch.where(selected >= 0, selected - main_key_offset, -1)
+                query_segments = tuple((s, e, ks-main_key_offset, ke-main_key_offset, residual)
+                                       for s, e, ks, ke, residual in query_segments)
             indexer_loss = shared_compressed_indexer_kl_loss(
                 indexer_output.index_query,
-                indexer_output.index_key,
+                index_key,
                 indexer_output.merge_weight,
                 query,
                 compressed_kv,
-                indexer_output.topk_indices,
+                selected,
                 self.sinks,
                 attention_scale=self.scaling,
                 loss_coeff=self.indexer.loss_coeff,
@@ -1478,12 +1582,14 @@ class SharedCompressedDSAAttentionBase(nn.Module):
     def _run_sparse_attention(
             self, query: torch.Tensor, key_value: torch.Tensor, compressed_kv: torch.Tensor | None,
             topk_indices: torch.Tensor | None, query_offset: int, global_sequence_length: int,
-            segment_starts: torch.Tensor | None, query_segments: tuple,
+            segment_starts: torch.Tensor | None, query_segments: tuple, raw_key_offset: int = 0,
+            main_key_offset: int = 0,
     ) -> torch.Tensor:
         """Run the chosen implementation; unsupported explicit fusion always raises."""
         if self.use_fused_ops:
+            expected_topk = min(512, global_sequence_length // max(1, self.compress_ratio))
             if not (self.candidate_source_layer_idx is None
-                    and (topk_indices is None or topk_indices.shape[-1] == min(512, compressed_kv.shape[1]))
+                    and (topk_indices is None or topk_indices.shape[-1] == expected_topk)
                     and supports_fused_attention_inputs(query, self.compress_ratio, self.sliding_window,
                                                  0 if topk_indices is None else topk_indices.shape[-1])):
                 raise RuntimeError(
@@ -1494,11 +1600,11 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 )
             return sparse_flash_mla(
                 query, key_value, compressed_kv, topk_indices, self.sinks, self.scaling,
-                self.compress_ratio, self.sliding_window, query_offset, query_segments,
+                self.compress_ratio, self.sliding_window, query_offset, query_segments, raw_key_offset, main_key_offset,
             )
         combined_key_value, sparse_indices = self._build_sparse_indices(
             key_value, compressed_kv, topk_indices, query.shape[2], query_offset,
-            global_sequence_length, segment_starts,
+            global_sequence_length, segment_starts, raw_key_offset, main_key_offset,
         )
         return reference_sparse_attention(query, combined_key_value, sparse_indices, self.sinks, self.scaling)
 
@@ -1560,12 +1666,16 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             hidden_states.device,
         )
 
+        raw_route, main_route, document_lengths = self._plan_bank_dispatch(
+            packed_sequence, cp_context, sequence_length, global_sequence_length, hidden_states.device,
+        )
+        raw_key_offset = 0 if raw_route is None else raw_route.global_start
         rope_type = "compress" if self.compress_ratio else "main"
         cos, sin = position_embeddings[rope_type]
-        key_value, raw_kv_handle = self._project_raw_kv(hidden_states, cos, sin, cp_context)
+        key_value, raw_kv_handle = self._project_raw_kv(hidden_states, cos, sin, cp_context, raw_route)
         query_residual, query = self._project_query(hidden_states, cos, sin)
         latent, compressed_handle = self._compute_compressed_kv(
-            hidden_states, position_embeddings, shared_state, cp_context
+            hidden_states, position_embeddings, shared_state, cp_context, main_route
         )
         indexer_output = self._run_indexer(
             hidden_states,
@@ -1578,24 +1688,31 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_offset,
             minimum_key_indices,
             query_segments,
+            document_lengths,
         )
 
         if raw_kv_handle is not None:
             key_value = raw_kv_handle.wait()
         if compressed_handle is not None:
-            shared_state.publish_compressed_kv(self.layer_idx, compressed_handle.wait())
+            shared_state.publish_compressed_kv(
+                self.layer_idx, compressed_handle.wait(), 0 if main_route is None else main_route.global_start,
+            )
         if key_value is None:
-            raise RuntimeError("raw KV all-gather did not produce a tensor")
+            raise RuntimeError("raw KV communication did not produce a tensor")
 
         compressed_kv = None
+        main_key_offset = 0
         topk_indices = None
         if self.compress_ratio:
             compressed_kv = shared_state.require_compressed_kv(self.kv_source_layer_idx, self.layer_idx)
             topk_indices = shared_state.require_topk_indices(self.index_source_layer_idx, self.layer_idx)
-        query = self._apply_indexer_loss(indexer_output, query, compressed_kv, tp_context, query_segments)
+            main_key_offset = shared_state.compressed_kv_offsets.get(self.kv_source_layer_idx, 0)
+        query = self._apply_indexer_loss(
+            indexer_output, query, compressed_kv, tp_context, query_segments, main_key_offset,
+        )
         attention_output = self._run_sparse_attention(
             query, key_value, compressed_kv, topk_indices, query_offset, global_sequence_length,
-            segment_starts, query_segments,
+            segment_starts, query_segments, raw_key_offset, main_key_offset,
         )
         output = self._project_output(attention_output, cos, sin, batch_size, sequence_length)
         return output, None
@@ -1612,6 +1729,10 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         context: Mapping[str, Any] | None = None,
         *,
         use_fused_ops: bool = False,
+        swa_comm: str = "all_to_all_v",
+        indexer_load_balance: str = "none",
+        main_kv_comm: str = "all_gather",
+        indexer_balance_block_size: int | None = None,
     ) -> None:
         """Transfer source state and select the implementation used for comparisons.
 
@@ -1624,6 +1745,17 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
                 raising on unsupported calls without automatic fallback.
                 False selects eager PyTorch attention, Indexer and KL on every
                 device, without loading optional operator extensions.
+            swa_comm: Raw KV communication, 'all_to_all_v' exchanges only the SWA
+                halo; 'all_gather' keeps the full-bank comparison.
+            indexer_load_balance: 'none', 'zigzag' or 'greedy' query-task allocation.
+                Selection exchanges low-rank qr, merge weights and rotary embeddings;
+                attention and KL retain the original owner and autograd graph.
+            indexer_balance_block_size: Maximum original query rows per greedy task,
+                before adjacent tasks on one worker are merged. Greedy defaults to 2048.
+                Explicit values require indexer_load_balance='greedy' and must be positive
+                and no larger than local Q. Omit this option for none/zigzag.
+            main_kv_comm: 'all_to_all_v' dispatches document-causal main KV prefixes;
+                'all_gather' retains the full-bank comparison. Index K is unchanged.
 
         Note:
             All implementations retain the same parameter and CP/TP contracts.
@@ -1633,18 +1765,29 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
             main attention, D=512, SWA=128, Indexer D=128, TopK=512 and TP=1.
             Active fused KL requires 8, 16, 32 or 64 Indexer heads. Candidate
             pools are unsupported. Packed inputs retain the existing alignment
-            constraints and are dispatched as separate BSND document segments.
+            constraints and use a native TND call for multiple document segments.
             The ops-transformer training extension is loaded on the first
             supported fused call; a missing extension raises ImportError.
         """
         if not isinstance(use_fused_ops, bool):
             raise ValueError(f"use_fused_ops must be a bool, got {use_fused_ops!r}")
+        if swa_comm not in ("all_gather", "all_to_all_v"):
+            raise ValueError("swa_comm must be 'all_gather' or 'all_to_all_v'")
+        if main_kv_comm not in ("all_gather", "all_to_all_v"):
+            raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
+        indexer_balance_block_size = resolve_indexer_balance_block_size(
+            indexer_load_balance, indexer_balance_block_size,
+        )
         del module_fqn, context
         super().__init__(
             module,
             replace_indexer=True,
             use_fused_ops=use_fused_ops,
         )
+        self.swa_comm = swa_comm
+        self.indexer_load_balance = indexer_load_balance
+        self.indexer_balance_block_size = indexer_balance_block_size
+        self.main_kv_comm = main_kv_comm
 
 
 __all__ = [

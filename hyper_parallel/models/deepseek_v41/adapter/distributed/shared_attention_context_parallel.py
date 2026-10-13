@@ -14,6 +14,8 @@
 # ============================================================================
 """Build TP/CP contexts for DeepSeek-V4.1 shared attention."""
 
+from __future__ import annotations
+
 from functools import wraps
 from typing import Any
 
@@ -31,11 +33,21 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
 from hyper_parallel.distributed.context_parallel.collectives import (
     async_cp_allgather_launch,
 )
+from hyper_parallel.distributed.context_parallel.indexer_balance import (
+    balanced_indexer_select, resolve_indexer_balance_block_size,
+)
+from hyper_parallel.distributed.context_parallel.sequence_dispatch import async_sequence_dispatch
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
 
 
-def _build_shared_attention_cp_context(cp_mesh: Any) -> SharedCompressedAttentionCPContext:
-    """Build V4.1's asynchronous KV-all-gather communication context."""
+def _build_shared_attention_cp_context(
+        cp_mesh: Any, swa_comm: str = "all_to_all_v", indexer_load_balance: str = "none",
+        main_kv_comm: str = "all_gather", indexer_balance_block_size: int | None = None,
+) -> SharedCompressedAttentionCPContext:
+    """Build SWA halo, optional main-bank prefixes and Index K all-gather."""
+    indexer_balance_block_size = resolve_indexer_balance_block_size(
+        indexer_load_balance, indexer_balance_block_size,
+    )
 
     def _gather_sequence(tensor: torch.Tensor, sequence_dim: int) -> torch.Tensor:
         """All-gather one sequence dimension in CP-rank order."""
@@ -45,11 +57,25 @@ def _build_shared_attention_cp_context(cp_mesh: Any) -> SharedCompressedAttentio
         """Launch a differentiable KV all-gather for projection overlap."""
         return async_cp_allgather_launch(tensor, sequence_dim, cp_mesh)
 
+    def _launch_dispatch(tensor: torch.Tensor, sequence_dim: int, route: Any) -> Any:
+        """Exchange planned bank intervals on the existing CP group."""
+        return async_sequence_dispatch(tensor, sequence_dim, route, cp_mesh.get_group())
+
+    def _balance_indexer(query_residual, weights, embeddings, selector, lengths, ratio):
+        """Move only selection tasks; differentiable banks and KL remain with owners."""
+        return balanced_indexer_select(
+            query_residual, weights, embeddings, selector, lengths, ratio, indexer_load_balance,
+            cp_mesh.get_group(), indexer_balance_block_size,
+        )
+
     return SharedCompressedAttentionCPContext(
         size=cp_mesh.size(),
         rank=cp_mesh.get_local_rank(),
         gather_sequence=_gather_sequence,
         launch_sequence=_launch_sequence,
+        launch_raw=_launch_dispatch if swa_comm == "all_to_all_v" else None,
+        launch_main=_launch_dispatch if main_kv_comm == "all_to_all_v" else None,
+        balance_indexer=_balance_indexer if indexer_load_balance != "none" else None,
     )
 
 
@@ -80,9 +106,9 @@ def deepseek_v41_shared_attention_parallel_wrapper(
 ) -> _ForwardRewriteRequest:
     """Install V4.1's explicit TP Indexer and Colossal CP collectives.
 
-    Queries and Top-K indices remain sequence-local; raw KV, compressed KV,
-    and index keys use asynchronous differentiable all-gather. Projection
-    GEMMs overlap communication. Indexer Q/merge heads remain TP-local and
+    Raw KV uses SWA halo all-to-all-v, with full all-gather as a comparison.
+    Main KV optionally exchanges document prefixes; Index K retains differentiable
+    all-gather. Launch/wait separation permits independent projection work. Indexer Q/merge heads remain TP-local and
     reduce their score and KL-target contributions before global Top-K.
     """
     del mesh, ep_mesh
@@ -95,7 +121,10 @@ def deepseek_v41_shared_attention_parallel_wrapper(
 
     original_forward = target_module.forward
     cp_context = (
-        _build_shared_attention_cp_context(cp_mesh)
+        _build_shared_attention_cp_context(
+            cp_mesh, target_module.swa_comm, target_module.indexer_load_balance, target_module.main_kv_comm,
+            target_module.indexer_balance_block_size,
+        )
         if cp_mesh is not None and cp_mesh.size() > 1
         else None
     )

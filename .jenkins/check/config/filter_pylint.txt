@@ -219,3 +219,7 @@
 # Linear replacements must preserve forward(input=...) for keyword calls and
 # the existing replacement executor's signature validation.
 "hyper-parallel/tests/ut/trainer/test_module_family_replacement.py" "redefined-builtin"
+
+# TND linear attention uses native Torch, following the Torch-only component contract.
+"hyper-parallel/hyper_parallel/components/functional/linear_attention_packed.py" "forbidden-backend-import"
+"hyper-parallel/hyper_parallel/models/qwen3_5/adapter/distributed/packed.py" "forbidden-backend-import"

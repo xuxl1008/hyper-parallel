@@ -219,3 +219,9 @@
 # Linear replacements must preserve forward(input=...) for keyword calls and
 # the existing replacement executor's signature validation.
 "hyper-parallel/tests/ut/trainer/test_module_family_replacement.py" "redefined-builtin"
+
+# Linear-attention layout and convolution adapters use native Torch, following
+# the Torch-only component contract; the legacy backend-import rule is narrower.
+"hyper-parallel/hyper_parallel/components/functional/linear_attention_packed.py" "forbidden-backend-import"
+"hyper-parallel/hyper_parallel/components/functional/linear_attention_convolution.py" "forbidden-backend-import"
+"hyper-parallel/hyper_parallel/models/qwen3_5/adapter/distributed/packed.py" "forbidden-backend-import"

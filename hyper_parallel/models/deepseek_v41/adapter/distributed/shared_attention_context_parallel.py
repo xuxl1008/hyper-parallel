@@ -14,6 +14,8 @@
 # ============================================================================
 """Build TP/CP contexts for DeepSeek-V4.1 shared attention."""
 
+from __future__ import annotations
+
 from functools import wraps
 from typing import Any
 
@@ -33,12 +35,14 @@ from hyper_parallel.distributed.context_parallel.collectives import (
     async_cp_allgather_launch,
 )
 from hyper_parallel.distributed.context_parallel.compressed_document import CompressionBoundaryRoute
+from hyper_parallel.distributed.context_parallel.sequence_dispatch import async_sequence_dispatch
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
 
 
-def _build_shared_attention_cp_context(cp_mesh: Any) -> SharedCompressedAttentionCPContext:
-    """Build V4.1's asynchronous KV-all-gather communication context."""
-
+def _build_shared_attention_cp_context(
+        cp_mesh: Any, swa_comm: str = "all_to_all_v", main_kv_comm: str = "all_gather",
+) -> SharedCompressedAttentionCPContext:
+    """Build raw/main bank communication while keeping Index K globally gathered."""
     def _gather_sequence(tensor: torch.Tensor, sequence_dim: int) -> torch.Tensor:
         """All-gather one sequence dimension in CP-rank order."""
         return async_cp_allgather_launch(tensor, sequence_dim, cp_mesh).wait()
@@ -59,12 +63,19 @@ def _build_shared_attention_cp_context(cp_mesh: Any) -> SharedCompressedAttentio
         # Even empty receives must remain connected so every rank participates in backward.
         return torch.cat((received, local), dim=0).movedim(0, 1).contiguous()
 
+    def _launch_dispatch(tensor: torch.Tensor, sequence_dim: int, route: Any) -> Any:
+        """Exchange planned bank intervals on the existing CP group."""
+        return async_sequence_dispatch(tensor, sequence_dim, route, cp_mesh.get_group())
+
     return SharedCompressedAttentionCPContext(
         size=cp_mesh.size(),
         rank=cp_mesh.get_local_rank(),
         gather_sequence=_gather_sequence,
         launch_sequence=_launch_sequence,
         exchange_boundary=_exchange_boundary,
+        launch_raw=_launch_dispatch if swa_comm == "all_to_all_v" else None,
+        launch_main=_launch_dispatch if main_kv_comm == "all_to_all_v" else None,
+        indexer_priority=True,
     )
 
 
@@ -95,9 +106,9 @@ def deepseek_v41_shared_attention_parallel_wrapper(
 ) -> _ForwardRewriteRequest:
     """Install V4.1's explicit TP Indexer and Colossal CP collectives.
 
-    Queries and Top-K indices remain sequence-local; raw KV, compressed KV,
-    and index keys use asynchronous differentiable all-gather. Projection
-    GEMMs overlap communication. Indexer Q/merge heads remain TP-local and
+    Raw KV uses SWA halo all-to-all-v, with full all-gather as a comparison.
+    Main KV selects prefix dispatch or all-gather; Index K remains globally gathered.
+    Launch/wait separation permits independent projection work. Indexer Q/merge heads remain TP-local and
     reduce their score and KL-target contributions before global Top-K.
     """
     del mesh, ep_mesh
@@ -110,7 +121,9 @@ def deepseek_v41_shared_attention_parallel_wrapper(
 
     original_forward = target_module.forward
     cp_context = (
-        _build_shared_attention_cp_context(cp_mesh)
+        _build_shared_attention_cp_context(
+            cp_mesh, target_module.swa_comm, target_module.main_kv_comm,
+        )
         if cp_mesh is not None and cp_mesh.size() > 1
         else None
     )
@@ -122,7 +135,7 @@ def deepseek_v41_shared_attention_parallel_wrapper(
 
     @wraps(original_forward)
     def cp_forward(*args: Any, **kwargs: Any) -> Any:
-        """Run local queries against CP-replicated V4.1 key/value states."""
+        """Run local queries against the configured V4.1 bank layouts."""
         if "shared_attention_cp_context" in kwargs or "shared_attention_tp_context" in kwargs:
             raise ValueError("shared attention parallel contexts are owned by the wrapper")
         call_kwargs = dict(kwargs)

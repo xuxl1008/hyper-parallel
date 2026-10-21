@@ -49,6 +49,7 @@ from hyper_parallel.core.activation_memory.wrapper import checkpoint_exclude_wra
 from hyper_parallel.distributed.context_parallel.compressed_document import (
     CompressionBoundaryRoute, compressed_document_offsets, document_compression_plan,
 )
+from hyper_parallel.distributed.context_parallel.index_key_dispatch import IndexKeyPlan
 from hyper_parallel.distributed.context_parallel.indexer_balance import (
     resolve_indexer_balance_block_size, validate_indexer_hybrid_thresholds,
 )
@@ -120,6 +121,7 @@ class SharedCompressedAttentionState:
     topk_indices_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     candidate_blocks_by_source: dict[int, torch.Tensor] = field(default_factory=dict)
     compressed_kv_offsets: dict[int, int] = field(default_factory=dict)
+    index_key_plans: dict[int, IndexKeyPlan] = field(default_factory=dict)
 
     @staticmethod
     def _require(
@@ -150,9 +152,13 @@ class SharedCompressedAttentionState:
             consumer_layer,
         )
 
-    def publish_index_key(self, source_layer: int, value: torch.Tensor) -> None:
-        """Publish the Full Indexer's shared key tensor."""
+    def publish_index_key(self, source_layer: int, value: torch.Tensor, plan: IndexKeyPlan | None = None) -> None:
+        """Publish the shared key tensor together with its independent physical layout."""
         self.index_key_by_source[source_layer] = value
+        if plan is None:
+            self.index_key_plans.pop(source_layer, None)
+        else:
+            self.index_key_plans[source_layer] = plan
 
     def require_index_key(self, source_layer: int | None, consumer_layer: int) -> torch.Tensor:
         """Read the Indexer key associated with a compressed-KV source."""
@@ -203,6 +209,7 @@ class SharedCompressedIndexerOutput:
     candidate_blocks: torch.Tensor | None
     index_query: torch.Tensor
     merge_weight: torch.Tensor
+    key_plan: IndexKeyPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -210,7 +217,8 @@ class SharedCompressedAttentionCPContext:
     """Communication for local queries and shared compressed banks.
 
     ``launch_raw`` exchanges the same-document SWA halo when supplied.
-    Optional ``launch_main`` exchanges main KV document prefixes.
+    Optional ``launch_main`` exchanges main KV document prefixes. ``launch_index``
+    and ``plan_index_key`` select independent compact Index K prefixes; otherwise
     Index K retains differentiable all-gather.
     Contexts without ``launch_raw`` provide the full raw-bank reference.
     """
@@ -222,6 +230,8 @@ class SharedCompressedAttentionCPContext:
     launch_raw: Callable[[torch.Tensor, int, SequenceDispatchRoute], SequenceGatherHandle] | None = None
     balance_indexer: Callable[..., torch.Tensor] | None = None
     launch_main: Callable[[torch.Tensor, int, SequenceDispatchRoute], SequenceGatherHandle] | None = None
+    launch_index: Callable[[torch.Tensor, int, IndexKeyPlan], SequenceGatherHandle] | None = None
+    plan_index_key: Callable[[tuple, int], IndexKeyPlan] | None = None
     exchange_boundary: Callable[[torch.Tensor, CompressionBoundaryRoute], torch.Tensor] | None = None
     launch_balance: Callable[..., Any] | None = None
     indexer_priority: bool = False
@@ -523,6 +533,54 @@ def _causal_key_bounds(
     return upper, lower.unsqueeze(0).expand(batch_size, -1)
 
 
+def _validate_causal_inputs(
+        query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor, compress_ratio: int,
+        query_chunk_size: int, minimum_key_indices: torch.Tensor | None,
+) -> None:
+    """Validate selection tensor relationships before scoring or native dispatch."""
+    if compress_ratio <= 0:
+        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+    if query_chunk_size <= 0:
+        raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
+    if query.ndim != 4:
+        raise ValueError(f"Indexer query must have shape [B, Q, H, D], got {tuple(query.shape)}")
+    batch_size, _, _, head_dim = query.shape
+    if key.ndim != 3 or key.shape[::2] != (batch_size, head_dim):
+        raise ValueError(
+            "compressed index key must have shape [batch, compressed_sequence, head_dim]"
+        )
+    if merge_weight.shape != query.shape[:3]:
+        raise ValueError(
+            f"merge_weight must have shape {tuple(query.shape[:3])}, got {tuple(merge_weight.shape)}"
+        )
+    if minimum_key_indices is not None and minimum_key_indices.shape != query.shape[:2]:
+        raise ValueError("minimum_key_indices must have shape [batch, query]")
+
+
+def _reference_causal_topk(
+        scores: torch.Tensor, top_k: int, logical_length: int,
+        key_global_positions: torch.Tensor | None,
+) -> torch.Tensor:
+    """Keep the reference TopK tie convention when remote K rows are omitted.
+
+    Eager TopK can choose different tied IDs when its input width changes.
+    Restore logical score slots only; the physical K bank stays compact.
+    Native LI already packs the same per-document prefix in both CP modes.
+    """
+    if key_global_positions is not None:
+        full_scores = scores.new_full((*scores.shape[:-1], logical_length), float("-inf"))
+        full_scores.index_copy_(-1, key_global_positions, scores)
+        scores = full_scores
+    length = scores.shape[-1]
+    top = scores.topk(min(top_k, length), dim=-1, sorted=False)
+    indices = top.indices.masked_fill(~torch.isfinite(top.values), length)
+    indices = sort_key_indices(indices, length)
+    indices = indices.masked_fill(indices == length, -1)
+    if indices.shape[-1] < top_k:
+        indices = torch.nn.functional.pad(indices, (0, top_k - indices.shape[-1]), value=-1)
+    return indices.to(torch.int32)
+
+
 @torch.no_grad()
 def compressed_causal_topk(
         query: torch.Tensor,
@@ -537,6 +595,8 @@ def compressed_causal_topk(
         minimum_key_indices: torch.Tensor | None = None,
         query_segments: tuple[tuple[int, int, int, int, int], ...] | None = None,
         use_fused: bool = False,
+        global_key_length: int | None = None,
+        key_global_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select compressed positions with V4.1's ratio-aware causal rule.
 
@@ -546,36 +606,24 @@ def compressed_causal_topk(
     document-local K prefixes; the reference retains TP score reductions.
 
     Args:
-        query_segments: Local Q intersections and global compressed K prefixes.
+        query_segments: Local Q intersections and physical compressed K prefixes.
+        global_key_length: Logical bank length before optional CP compaction, used
+            to retain the global output width. Unfilled slots remain -1.
+        key_global_positions: Optional compact-to-global row IDs for eager TopK.
+            Logical score slots preserve the original reference tie selection.
         use_fused: Select LI V2 and raise if a nonempty call is unsupported.
             False explicitly selects the numerical reference.
     """
-    if compress_ratio <= 0:
-        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
-    if query_chunk_size <= 0:
-        raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
-    if query.ndim != 4:
-        raise ValueError(f"Indexer query must have shape [B, Q, H, D], got {tuple(query.shape)}")
-    batch_size, sequence_length, _, head_dim = query.shape
-    if key.ndim != 3 or key.shape[::2] != (batch_size, head_dim):
-        raise ValueError(
-            "compressed index key must have shape [batch, compressed_sequence, head_dim]"
-        )
-    if merge_weight.shape != query.shape[:3]:
-        raise ValueError(
-            f"merge_weight must have shape {tuple(query.shape[:3])}, got {tuple(merge_weight.shape)}"
-        )
+    _validate_causal_inputs(query, key, merge_weight, compress_ratio, query_chunk_size, minimum_key_indices)
+    batch_size, sequence_length = query.shape[:2]
     compressed_length = key.shape[1]
-    if minimum_key_indices is not None and minimum_key_indices.shape != query.shape[:2]:
-        raise ValueError("minimum_key_indices must have shape [batch, query]")
-    top_k = min(sparse_count, compressed_length)
-    if top_k <= 0 or sequence_length == 0:
-        return torch.empty(
-            batch_size,
-            sequence_length,
-            max(top_k, 0),
-            dtype=torch.int32,
-            device=query.device,
+    logical_length = compressed_length if global_key_length is None else global_key_length
+    if logical_length < compressed_length:
+        raise ValueError("global_key_length cannot be shorter than the physical Index K bank")
+    top_k = min(sparse_count, logical_length)
+    if top_k <= 0 or sequence_length == 0 or compressed_length == 0:
+        return torch.full(
+            (batch_size, sequence_length, max(top_k, 0)), -1, dtype=torch.int32, device=query.device,
         )
 
     if use_fused:
@@ -584,11 +632,11 @@ def compressed_causal_topk(
             reduce_sum, minimum_key_indices, query_segments,
         )
 
-    visible_keys, minimum_key_indices = _causal_key_bounds(
-        query, compress_ratio, query_offset, minimum_key_indices, query_segments,
-    )
     key_fp32 = key.float().transpose(1, 2).unsqueeze(1)
     key_positions = torch.arange(compressed_length, device=query.device).view(1, 1, -1)
+    upper_limits, minimum_key_indices = _causal_key_bounds(
+        query, compress_ratio, query_offset, minimum_key_indices, query_segments,
+    )
     selected_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
@@ -597,16 +645,12 @@ def compressed_causal_topk(
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)
-        visible = visible_keys[start:end]
+        visible = upper_limits[start:end]
         scores.masked_fill_(key_positions >= visible.view(1, -1, 1), float("-inf"))
         if minimum_key_indices is not None:
             minimum = minimum_key_indices[:, start:end].unsqueeze(-1)
             scores.masked_fill_(key_positions < minimum, float("-inf"))
-        top = scores.topk(top_k, dim=-1, sorted=False)
-        indices = top.indices.masked_fill(~torch.isfinite(top.values), compressed_length)
-        indices = sort_key_indices(indices, compressed_length)
-        indices = indices.masked_fill(indices == compressed_length, -1)
-        selected_chunks.append(indices.to(torch.int32))
+        selected_chunks.append(_reference_causal_topk(scores, top_k, logical_length, key_global_positions))
     return torch.cat(selected_chunks, dim=1)
 
 
@@ -1115,10 +1159,11 @@ class SharedCompressedDSAIndexer(nn.Module):
             sin: torch.Tensor,
             index_key: torch.Tensor | None,
             cp_context: SharedCompressedAttentionCPContext | None,
+            key_plan: IndexKeyPlan | None,
             block_plan: Any = None,
             key_position_embeddings: tuple | None = None,
     ) -> tuple[torch.Tensor, "SequenceGatherHandle | None"]:
-        """Project or adopt the index key and launch its CP gather."""
+        """Project or adopt Index K and launch its configured differentiable exchange."""
         if self.owns_key:
             if latent is None:
                 raise RuntimeError("a Full Indexer requires the compressor latent")
@@ -1130,15 +1175,34 @@ class SharedCompressedDSAIndexer(nn.Module):
             else:
                 key_cos, key_sin = key_position_embeddings
             key = _apply_v41_rope(key.unsqueeze(1), key_cos, key_sin).squeeze(1)
-            key_handle = None
-            if cp_context is not None:
-                key_handle = (cp_context.launch(key, 1) if block_plan is None
-                              else block_plan.launch_bank(key, cp_context))
+            if key_plan is not None:
+                key_handle = cp_context.launch_index(key, 1, key_plan)
+            elif cp_context is not None and block_plan is not None:
+                key_handle = block_plan.launch_bank(key, cp_context)
+            else:
+                key_handle = cp_context.launch(key, 1) if cp_context is not None else None
             return key, key_handle
         if index_key is None:
             raise RuntimeError("a Reindex layer requires index K from the preceding Full layer")
         return index_key, None
 
+    def _resolve_key_plan(
+            self, cp_context: SharedCompressedAttentionCPContext | None, lengths: tuple,
+            source_plan: IndexKeyPlan | None,
+    ) -> IndexKeyPlan | None:
+        """Require one communication policy for all consumers of a shared bank."""
+        plan = None
+        if cp_context is not None and cp_context.plan_index_key is not None:
+            if cp_context.launch_index is None:
+                raise ValueError("Index K prefix planning requires its differentiable dispatch callback")
+            if self.is_candidate_source or self.uses_candidates:
+                raise NotImplementedError("Index K prefix dispatch currently requires ordinary causal selection")
+            plan = cp_context.plan_index_key(lengths, self.compress_ratio)
+        if not self.owns_key and plan != source_plan:
+            raise ValueError(
+                "Full/Reindex consumers of one Index K bank must share compression and CP dispatch settings"
+            )
+        return plan
 
     def forward(
             self,
@@ -1155,6 +1219,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             minimum_key_indices: torch.Tensor | None = None,
             query_segments: tuple[tuple[int, int, int, int, int], ...] | None = None,
             document_lengths: tuple[int, ...] = (),
+            index_key_plan: IndexKeyPlan | None = None,
             block_plan: Any = None,
             key_position_embeddings: tuple | None = None,
             prepare_attention: Callable[[], None] | None = None,
@@ -1172,6 +1237,7 @@ class SharedCompressedDSAIndexer(nn.Module):
                 length % self.compress_ratio for length in document_lengths):
             raise NotImplementedError("Natural document compression requires ordinary causal Indexer selection")
 
+        key_plan = self._resolve_key_plan(cp_context, document_lengths, index_key_plan)
         if (cp_context is not None and cp_context.launch_balance is not None
                 and (not document_lengths or any(length >= self.compress_ratio for length in document_lengths))):
             if tp_context is not None or self.is_candidate_source or self.uses_candidates:
@@ -1181,7 +1247,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             launch = self._launch_selection if self._input_region is None else self._input_region
             wave = launch(query_residual, weights, (cos, sin), document_lengths, cp_context)
             key, handle = self._project_index_key(
-                latent, cos, sin, index_key, cp_context, block_plan, key_position_embeddings,
+                latent, cos, sin, index_key, cp_context, key_plan, block_plan, key_position_embeddings,
             )
             if prepare_attention is not None:
                 prepare_attention()
@@ -1193,15 +1259,15 @@ class SharedCompressedDSAIndexer(nn.Module):
             if not cp_context.indexer_priority:
                 prepared = prepare(wave)
             select = self._select_dispatched if self._result_region is None else self._result_region
-            result = select(prepared, key)
+            result = select(prepared, key, key_plan)
             del prepared
             query = self._project_index_query(query_residual, cos, sin)
             if weights.shape[-1] != query.shape[2]:
                 raise ValueError("Indexer query and merge weights must have matching head counts")
             finish = self._finish_selection if self._wait_region is None else self._wait_region
-            return SharedCompressedIndexerOutput(finish(result), key, None, query, weights)
+            return SharedCompressedIndexerOutput(finish(result), key, None, query, weights, key_plan)
         key, key_handle = self._project_index_key(
-            latent, cos, sin, index_key, cp_context, block_plan, key_position_embeddings,
+            latent, cos, sin, index_key, cp_context, key_plan, block_plan, key_position_embeddings,
         )
         if prepare_attention is not None:
             prepare_attention()
@@ -1221,7 +1287,7 @@ class SharedCompressedDSAIndexer(nn.Module):
         topk_indices, candidate_blocks = self._run_selection(
             query, key, merge_weight, query_residual, (cos, sin), cp_context, tp_context,
             candidate_blocks, query_offset, reduce_sum, minimum_key_indices, query_segments,
-            document_lengths,
+            document_lengths, key_plan,
         )
         return SharedCompressedIndexerOutput(
             topk_indices=topk_indices,
@@ -1229,6 +1295,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             candidate_blocks=candidate_blocks,
             index_query=query,
             merge_weight=merge_weight,
+            key_plan=key_plan,
         )
 
     def enable_selection_exclude(self) -> None:
@@ -1258,10 +1325,10 @@ class SharedCompressedDSAIndexer(nn.Module):
         return query, weights, wave
 
     @torch.no_grad()
-    def _select_dispatched(self, prepared: tuple, key: torch.Tensor) -> Any:
+    def _select_dispatched(self, prepared: tuple, key: torch.Tensor, key_plan: IndexKeyPlan | None) -> Any:
         """Consume worker Q once and launch the inverse ID transfer."""
         query, weights, wave = prepared
-        selected = self._select_indices(query, key, weights, None, 0, None, None, wave.route.segments)[0]
+        selected = self._select_indices(query, key, weights, None, 0, None, None, wave.route.segments, key_plan)[0]
         return wave.launch_result(selected[0])
 
     @staticmethod
@@ -1283,7 +1350,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             candidate_blocks: torch.Tensor | None, query_offset: int,
             reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
             minimum_key_indices: torch.Tensor | None, query_segments: tuple | None,
-            document_lengths: tuple,
+            document_lengths: tuple, key_plan: IndexKeyPlan | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Cache dispatch, discrete selection and TopK return as one recompute region."""
         cos, sin = embeddings
@@ -1300,7 +1367,7 @@ class SharedCompressedDSAIndexer(nn.Module):
                 """Project on the receiver while this layer's parameters are resident."""
                 task_query = self._project_index_query(task_qr, *task_embeddings)
                 return self._select_indices(
-                    task_query, key, task_weights, None, 0, None, None, segments,
+                    task_query, key, task_weights, None, 0, None, None, segments, key_plan,
                 )[0]
 
             topk_indices = cp_context.balance_indexer(
@@ -1310,7 +1377,7 @@ class SharedCompressedDSAIndexer(nn.Module):
         else:
             topk_indices, candidate_blocks = self._select_indices(
                 query, key, merge_weight, candidate_blocks, query_offset,
-                reduce_sum, minimum_key_indices, query_segments,
+                reduce_sum, minimum_key_indices, query_segments, key_plan,
             )
         return topk_indices, candidate_blocks
 
@@ -1319,6 +1386,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             candidate_blocks: torch.Tensor | None, query_offset: int,
             reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
             minimum_key_indices: torch.Tensor | None, query_segments: tuple | None,
+            key_plan: IndexKeyPlan | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Select the requested implementation without changing candidate policies."""
         if self.use_fused and (self.is_candidate_source or self.uses_candidates):
@@ -1365,9 +1433,14 @@ class SharedCompressedDSAIndexer(nn.Module):
                 query_chunk_size=self.query_chunk_size,
                 reduce_sum=reduce_sum,
                 minimum_key_indices=minimum_key_indices,
-                query_segments=query_segments,
+                query_segments=query_segments if key_plan is None else key_plan.map_segments(query_segments),
                 use_fused=self.use_fused,
+                global_key_length=None if key_plan is None else key_plan.global_length,
+                key_global_positions=(None if key_plan is None or self.use_fused
+                                      else key_plan.global_positions(key.device)),
             )
+        if key_plan is not None and self.use_fused:
+            topk_indices = key_plan.global_indices(topk_indices, query_segments)
         return topk_indices, candidate_blocks
 
 
@@ -1729,6 +1802,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             document_lengths=document_lengths,
             block_plan=block_plan,
             key_position_embeddings=key_position_embeddings,
+            index_key_plan=shared_state.index_key_plans.get(self.kv_source_layer_idx),
         )
         if is_recomputing():
             # A recompute must not publish again: its consumers read the entries
@@ -1736,7 +1810,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             # single-publisher contract.
             return indexer_output
         if self.indexer.owns_key:
-            shared_state.publish_index_key(self.layer_idx, indexer_output.index_key)
+            shared_state.publish_index_key(self.layer_idx, indexer_output.index_key, indexer_output.key_plan)
         shared_state.publish_topk_indices(self.layer_idx, indexer_output.topk_indices)
         if indexer_output.candidate_blocks is not None:
             shared_state.publish_candidate_blocks(
@@ -1811,7 +1885,16 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             # KL uses the original owner's queries. A view aligns its student K
             # with the compact teacher bank while preserving global Index K gradients.
             index_key = indexer_output.index_key
-            if main_key_offset or compressed_kv.shape[1] != index_key.shape[1]:
+            if indexer_output.key_plan is not None:
+                plan = indexer_output.key_plan
+                owner_start, owner_end, _ = plan.owner_range
+                offset = owner_start - main_key_offset
+                if offset < 0 or owner_end - main_key_offset > compressed_kv.shape[1]:
+                    raise ValueError("Main KV bank does not cover the original owner's KL prefix")
+                compressed_kv = compressed_kv.narrow(1, offset, owner_end - owner_start)
+                index_key = plan.owner_view(index_key)
+                main_key_offset = owner_start
+            elif main_key_offset or compressed_kv.shape[1] != index_key.shape[1]:
                 index_key = index_key[:, main_key_offset:main_key_offset+compressed_kv.shape[1]]
             selected = indexer_output.topk_indices
             if main_key_offset:
@@ -2018,6 +2101,7 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         indexer_load_balance: str = "none",
         main_kv_comm: str = "all_gather",
         indexer_balance_block_size: int | None = None,
+        index_k_comm: str = "all_gather",
         indexer_zigzag_min_length: int | None = None,
         indexer_zigzag_min_chunk_size: int | None = None,
     ) -> None:
@@ -2047,6 +2131,9 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
                 leading remainders and other documents share the greedy pool and row budget.
             main_kv_comm: 'all_to_all_v' dispatches document-causal main KV prefixes;
                 'all_gather' retains the full-bank comparison.
+            index_k_comm: 'all_to_all_v' exchanges the union of worker-LI and owner-KL
+                document prefixes. 'all_gather' retains the global bank. All Full/Reindex
+                consumers of a shared source must use the same CP/balance settings.
 
         Note:
             All implementations retain the same parameter and CP/TP contracts.
@@ -2067,6 +2154,8 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
             raise ValueError("swa_comm must be 'all_gather' or 'all_to_all_v'")
         if main_kv_comm not in ("all_gather", "all_to_all_v"):
             raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
+        if index_k_comm not in ("all_gather", "all_to_all_v"):
+            raise ValueError("index_k_comm must be 'all_gather' or 'all_to_all_v'")
         indexer_balance_block_size = resolve_indexer_balance_block_size(
             indexer_load_balance, indexer_balance_block_size,
         )
@@ -2085,6 +2174,7 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         self.indexer_zigzag_min_length = indexer_zigzag_min_length
         self.indexer_zigzag_min_chunk_size = indexer_zigzag_min_chunk_size
         self.main_kv_comm = main_kv_comm
+        self.index_k_comm = index_k_comm
 
 
 __all__ = [

@@ -35,6 +35,7 @@ from hyper_parallel.distributed.context_parallel.collectives import (
     async_cp_allgather_launch,
 )
 from hyper_parallel.distributed.context_parallel.compressed_document import CompressionBoundaryRoute
+from hyper_parallel.distributed.context_parallel.index_key_dispatch import IndexKeyPlan, index_key_plan
 from hyper_parallel.distributed.context_parallel.indexer_balance import (
     balanced_indexer_select, launch_indexer_inputs, resolve_indexer_balance_block_size,
     validate_indexer_hybrid_thresholds,
@@ -46,9 +47,12 @@ from hyper_parallel.distributed.recipe_spec import inner_wrapper
 def _build_shared_attention_cp_context(
         cp_mesh: Any, swa_comm: str = "all_to_all_v", indexer_load_balance: str = "none",
         main_kv_comm: str = "all_gather", indexer_balance_block_size: int | None = None,
+        index_k_comm: str = "all_gather",
         indexer_zigzag_min_length: int | None = None, indexer_zigzag_min_chunk_size: int | None = None,
 ) -> SharedCompressedAttentionCPContext:
-    """Build raw/main bank communication while keeping Index K globally gathered."""
+    """Build independently configured raw, main and Index K bank communication."""
+    if index_k_comm not in ("all_gather", "all_to_all_v"):
+        raise ValueError("index_k_comm must be 'all_gather' or 'all_to_all_v'")
     indexer_balance_block_size = resolve_indexer_balance_block_size(
         indexer_load_balance, indexer_balance_block_size,
     )
@@ -81,6 +85,18 @@ def _build_shared_attention_cp_context(
         """Exchange planned bank intervals on the existing CP group."""
         return async_sequence_dispatch(tensor, sequence_dim, route, cp_mesh.get_group())
 
+    def _launch_index(tensor: torch.Tensor, sequence_dim: int, plan: IndexKeyPlan) -> Any:
+        """Send the worker/owner union, but return only the owner's KL gradients."""
+        return async_sequence_dispatch(
+            tensor, sequence_dim, plan.dispatch, cp_mesh.get_group(), gradient=plan.gradient,
+        )
+
+    def _plan_index_key(lengths: tuple, ratio: int) -> Any:
+        """Cache the union of balanced-worker and original-owner prefix requirements."""
+        return index_key_plan(lengths, cp_mesh.size(), cp_mesh.get_local_rank(), ratio,
+                              indexer_load_balance, indexer_balance_block_size,
+                              indexer_zigzag_min_length, indexer_zigzag_min_chunk_size)
+
     def _balance_indexer(query_residual, weights, embeddings, selector, lengths, ratio):
         """Move only selection tasks; differentiable banks and KL remain with owners."""
         return balanced_indexer_select(
@@ -105,6 +121,8 @@ def _build_shared_attention_cp_context(
         exchange_boundary=_exchange_boundary,
         launch_raw=_launch_dispatch if swa_comm == "all_to_all_v" else None,
         launch_main=_launch_dispatch if main_kv_comm == "all_to_all_v" else None,
+        launch_index=_launch_index if index_k_comm == "all_to_all_v" else None,
+        plan_index_key=_plan_index_key if index_k_comm == "all_to_all_v" else None,
         balance_indexer=_balance_indexer if indexer_load_balance != "none" else None,
         launch_balance=_launch_balance if indexer_load_balance != "none" else None,
         indexer_priority=True,
@@ -139,7 +157,7 @@ def deepseek_v41_shared_attention_parallel_wrapper(
     """Install V4.1's explicit TP Indexer and Colossal CP collectives.
 
     Raw KV uses SWA halo all-to-all-v, with full all-gather as a comparison.
-    Main KV selects prefix dispatch or all-gather; Index K remains globally gathered.
+    Main KV and Index K independently select document-prefix dispatch or all-gather.
     Launch/wait separation permits independent projection work. Indexer Q/merge heads remain TP-local and
     reduce their score and KL-target contributions before global Top-K.
     """
@@ -155,7 +173,7 @@ def deepseek_v41_shared_attention_parallel_wrapper(
     cp_context = (
         _build_shared_attention_cp_context(
             cp_mesh, target_module.swa_comm, target_module.indexer_load_balance, target_module.main_kv_comm,
-            target_module.indexer_balance_block_size,
+            target_module.indexer_balance_block_size, target_module.index_k_comm,
             target_module.indexer_zigzag_min_length, target_module.indexer_zigzag_min_chunk_size,
         )
         if cp_mesh is not None and cp_mesh.size() > 1

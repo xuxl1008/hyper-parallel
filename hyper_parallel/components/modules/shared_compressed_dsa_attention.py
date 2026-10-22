@@ -49,6 +49,9 @@ from hyper_parallel.core.activation_memory.wrapper import checkpoint_exclude_wra
 from hyper_parallel.distributed.context_parallel.compressed_document import (
     CompressionBoundaryRoute, compressed_document_offsets, document_compression_plan,
 )
+from hyper_parallel.distributed.context_parallel.indexer_balance import (
+    resolve_indexer_balance_block_size, validate_indexer_hybrid_thresholds,
+)
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import (
     SequenceDispatchRoute, document_prefix_route, sliding_window_route,
 )
@@ -217,8 +220,10 @@ class SharedCompressedAttentionCPContext:
     gather_sequence: Callable[[torch.Tensor, int], torch.Tensor]
     launch_sequence: Callable[[torch.Tensor, int], SequenceGatherHandle] | None = None
     launch_raw: Callable[[torch.Tensor, int, SequenceDispatchRoute], SequenceGatherHandle] | None = None
+    balance_indexer: Callable[..., torch.Tensor] | None = None
     launch_main: Callable[[torch.Tensor, int, SequenceDispatchRoute], SequenceGatherHandle] | None = None
     exchange_boundary: Callable[[torch.Tensor, CompressionBoundaryRoute], torch.Tensor] | None = None
+    launch_balance: Callable[..., Any] | None = None
     indexer_priority: bool = False
 
     def launch(self, tensor: torch.Tensor, sequence_dim: int) -> SequenceGatherHandle:
@@ -503,7 +508,7 @@ def _causal_key_bounds(
         query: torch.Tensor, ratio: int, query_offset: int,
         minimum_key_indices: torch.Tensor | None, segments: tuple | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Derive visibility from original query positions within each independently compressed document."""
+    """Derive visibility from original query positions after task redistribution."""
     batch_size, length = query.shape[:2]
     if segments is None:
         positions = torch.arange(query_offset, query_offset + length, device=query.device)
@@ -1061,6 +1066,10 @@ class SharedCompressedDSAIndexer(nn.Module):
     # It is written through ``object.__setattr__`` so the exclusion region stays
     # out of ``modules()`` and the state dict.
     _selection_region: Callable[..., Any] | None = None
+    _input_region: Callable[..., Any] | None = None
+    _prepare_region: Callable[..., Any] | None = None
+    _result_region: Callable[..., Any] | None = None
+    _wait_region: Callable[..., Any] | None = None
 
     def __init__(self, module: nn.Module) -> None:
         """Transfer the source projections without changing checkpoint names."""
@@ -1086,6 +1095,18 @@ class SharedCompressedDSAIndexer(nn.Module):
         self.loss_coeff = module.loss_coeff
         self.query_chunk_size = int(getattr(module, "query_chunk_size", 256))
         self.train(module.training)
+
+    def _project_index_query(
+            self, query_residual: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project queries with their original rotary positions, including moved tasks."""
+        query = self.q_b_proj(query_residual.detach())
+        if query.shape[-1] % self.head_dim:
+            raise ValueError(
+                f"Indexer query width {query.shape[-1]} is not divisible by head_dim {self.head_dim}"
+            )
+        query = query.view(*query_residual.shape[:2], -1, self.head_dim)
+        return _apply_v41_rope(query.transpose(1, 2), cos, sin).transpose(1, 2)
 
     def _project_index_key(
             self,
@@ -1118,6 +1139,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             raise RuntimeError("a Reindex layer requires index K from the preceding Full layer")
         return index_key, None
 
+
     def forward(
             self,
             hidden_states: torch.Tensor,
@@ -1132,6 +1154,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             query_offset: int = 0,
             minimum_key_indices: torch.Tensor | None = None,
             query_segments: tuple[tuple[int, int, int, int, int], ...] | None = None,
+            document_lengths: tuple[int, ...] = (),
             block_plan: Any = None,
             key_position_embeddings: tuple | None = None,
             prepare_attention: Callable[[], None] | None = None,
@@ -1144,24 +1167,47 @@ class SharedCompressedDSAIndexer(nn.Module):
         recomputation, so the chosen key set can never drift and the checkpoint
         keeps saving the same tensors in both passes.
         """
-        batch_size, sequence_length, _ = hidden_states.shape
         cos, sin = compress_position_embeddings
+        if (self.is_candidate_source or self.uses_candidates) and any(
+                length % self.compress_ratio for length in document_lengths):
+            raise NotImplementedError("Natural document compression requires ordinary causal Indexer selection")
 
+        if (cp_context is not None and cp_context.launch_balance is not None
+                and (not document_lengths or any(length >= self.compress_ratio for length in document_lengths))):
+            if tp_context is not None or self.is_candidate_source or self.uses_candidates:
+                raise NotImplementedError("Indexer overlap requires ordinary causal selection and TP=1")
+            weights = self.weights_proj(hidden_states.detach())
+            weights = weights * (self.head_dim**-0.5 * self.global_num_heads**-0.5)
+            launch = self._launch_selection if self._input_region is None else self._input_region
+            wave = launch(query_residual, weights, (cos, sin), document_lengths, cp_context)
+            key, handle = self._project_index_key(
+                latent, cos, sin, index_key, cp_context, block_plan, key_position_embeddings,
+            )
+            if prepare_attention is not None:
+                prepare_attention()
+            prepare = self._prepare_dispatched if self._prepare_region is None else self._prepare_region
+            prepared = prepare(wave) if cp_context.indexer_priority else None
+            # KL uses this autograd edge; only selection transport runs under no_grad.
+            if handle is not None:
+                key = handle.wait()
+            if not cp_context.indexer_priority:
+                prepared = prepare(wave)
+            select = self._select_dispatched if self._result_region is None else self._result_region
+            result = select(prepared, key)
+            del prepared
+            query = self._project_index_query(query_residual, cos, sin)
+            if weights.shape[-1] != query.shape[2]:
+                raise ValueError("Indexer query and merge weights must have matching head counts")
+            finish = self._finish_selection if self._wait_region is None else self._wait_region
+            return SharedCompressedIndexerOutput(finish(result), key, None, query, weights)
         key, key_handle = self._project_index_key(
             latent, cos, sin, index_key, cp_context, block_plan, key_position_embeddings,
         )
-
         if prepare_attention is not None:
             prepare_attention()
 
-        query = self.q_b_proj(query_residual.detach())
-        if query.shape[-1] % self.head_dim:
-            raise ValueError(
-                f"Indexer query width {query.shape[-1]} is not divisible by head_dim {self.head_dim}"
-            )
-        local_num_heads = query.shape[-1] // self.head_dim
-        query = query.view(batch_size, sequence_length, local_num_heads, self.head_dim)
-        query = _apply_v41_rope(query.transpose(1, 2), cos, sin).transpose(1, 2)
+        query = self._project_index_query(query_residual, cos, sin)
+        local_num_heads = query.shape[2]
         merge_weight = self.weights_proj(hidden_states.detach())
         if merge_weight.shape[-1] != local_num_heads:
             raise ValueError(
@@ -1173,8 +1219,9 @@ class SharedCompressedDSAIndexer(nn.Module):
         if key_handle is not None:
             key = key_handle.wait()
         topk_indices, candidate_blocks = self._run_selection(
-            query, key, merge_weight, candidate_blocks, query_offset,
-            reduce_sum, minimum_key_indices, query_segments,
+            query, key, merge_weight, query_residual, (cos, sin), cp_context, tp_context,
+            candidate_blocks, query_offset, reduce_sum, minimum_key_indices, query_segments,
+            document_lengths,
         )
         return SharedCompressedIndexerOutput(
             topk_indices=topk_indices,
@@ -1187,13 +1234,85 @@ class SharedCompressedDSAIndexer(nn.Module):
     def enable_selection_exclude(self) -> None:
         """Keep discrete selection fixed when the enclosing layer recomputes."""
         object.__setattr__(
-            self, "_selection_region", checkpoint_exclude_wrapper(self._select_indices)
+            self, "_selection_region", checkpoint_exclude_wrapper(self._select_tokens)
         )
+        object.__setattr__(self, "_input_region", checkpoint_exclude_wrapper(self._launch_selection))
+        # This output goes straight into an exclusion region; retain IDs, not expanded worker Q.
+        object.__setattr__(self, "_prepare_region", checkpoint_exclude_wrapper(
+            self._prepare_dispatched, save_output=False,
+        ))
+        object.__setattr__(self, "_result_region", checkpoint_exclude_wrapper(self._select_dispatched))
+        object.__setattr__(self, "_wait_region", checkpoint_exclude_wrapper(self._finish_selection))
+
+    @torch.no_grad()
+    def _launch_selection(self, qr: torch.Tensor, weights: torch.Tensor, embeddings: tuple,
+                          lengths: tuple, context: SharedCompressedAttentionCPContext) -> Any:
+        """Cache the input launch so checkpoint replay does not repeat communication."""
+        return context.launch_balance(qr, weights, embeddings, lengths, self.compress_ratio)
+
+    @torch.no_grad()
+    def _prepare_dispatched(self, wave: Any) -> tuple:
+        """Expand received qr while Index K may still be in flight."""
+        qr, weights, cos, sin = wave.wait()
+        query = self._project_index_query(qr, cos, sin)
+        return query, weights, wave
+
+    @torch.no_grad()
+    def _select_dispatched(self, prepared: tuple, key: torch.Tensor) -> Any:
+        """Consume worker Q once and launch the inverse ID transfer."""
+        query, weights, wave = prepared
+        selected = self._select_indices(query, key, weights, None, 0, None, None, wave.route.segments)[0]
+        return wave.launch_result(selected[0])
+
+    @staticmethod
+    @torch.no_grad()
+    def _finish_selection(result: Any) -> torch.Tensor:
+        """Cache completed IDs; replay never consumes an already finished handle."""
+        return result.wait().unsqueeze(0)
 
     def _run_selection(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Select directly, or reuse the result retained by the checkpoint region."""
-        selection = self._select_indices if self._selection_region is None else self._selection_region
+        selection = self._select_tokens if self._selection_region is None else self._selection_region
         return selection(*args, **kwargs)
+
+    def _select_tokens(
+            self, query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor,
+            query_residual: torch.Tensor, embeddings: tuple,
+            cp_context: SharedCompressedAttentionCPContext | None,
+            tp_context: SharedCompressedAttentionTPContext | None,
+            candidate_blocks: torch.Tensor | None, query_offset: int,
+            reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
+            minimum_key_indices: torch.Tensor | None, query_segments: tuple | None,
+            document_lengths: tuple,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Cache dispatch, discrete selection and TopK return as one recompute region."""
+        cos, sin = embeddings
+        global_keys = sum(length // self.compress_ratio for length in document_lengths)
+        if document_lengths and not global_keys:
+            topk_indices = torch.empty((*query.shape[:2], 0), device=query.device, dtype=torch.long)
+            candidate_blocks = None
+        elif cp_context is not None and cp_context.balance_indexer is not None:
+            if tp_context is not None or self.is_candidate_source or self.uses_candidates:
+                raise NotImplementedError("Indexer load balance currently requires ordinary causal selection and TP=1")
+
+            def select_tasks(task_qr: torch.Tensor, task_weights: torch.Tensor,
+                             task_embeddings: tuple, segments: tuple) -> torch.Tensor:
+                """Project on the receiver while this layer's parameters are resident."""
+                task_query = self._project_index_query(task_qr, *task_embeddings)
+                return self._select_indices(
+                    task_query, key, task_weights, None, 0, None, None, segments,
+                )[0]
+
+            topk_indices = cp_context.balance_indexer(
+                query_residual, merge_weight, (cos, sin), select_tasks, document_lengths, self.compress_ratio,
+            )
+            candidate_blocks = None
+        else:
+            topk_indices, candidate_blocks = self._select_indices(
+                query, key, merge_weight, candidate_blocks, query_offset,
+                reduce_sum, minimum_key_indices, query_segments,
+            )
+        return topk_indices, candidate_blocks
 
     def _select_indices(
             self, query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor,
@@ -1574,6 +1693,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_offset: int,
             minimum_key_indices: torch.Tensor | None,
             query_segments: tuple,
+            document_lengths: tuple[int, ...],
             block_plan: Any = None,
             key_position_embeddings: tuple | None = None,
             prepare_attention: Callable[[], None] | None = None,
@@ -1598,6 +1718,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_residual,
             latent,
             position_embeddings["compress"],
+            prepare_attention=prepare_attention,
             index_key=index_key,
             candidate_blocks=candidate_blocks,
             cp_context=cp_context,
@@ -1605,9 +1726,9 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_offset=query_offset,
             minimum_key_indices=minimum_key_indices,
             query_segments=query_segments,
+            document_lengths=document_lengths,
             block_plan=block_plan,
             key_position_embeddings=key_position_embeddings,
-            prepare_attention=prepare_attention,
         )
         if is_recomputing():
             # A recompute must not publish again: its consumers read the entries
@@ -1822,7 +1943,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         cos, sin = position_embeddings[rope_type]
         key_value, raw_kv_handle = self._project_raw_kv(hidden_states, cos, sin, cp_context, raw_route)
         overlap = (self.is_index_source and cp_context is not None
-                   and cp_context.indexer_priority)
+                   and (cp_context.indexer_priority or cp_context.launch_balance is not None))
         prepare_attention = None
         if overlap:
             query_residual = self.q_a_norm(self.q_a_proj(hidden_states))
@@ -1853,6 +1974,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_offset,
             minimum_key_indices,
             query_segments,
+            document_lengths,
             block_plan,
             key_positions,
             prepare_attention=prepare_attention,
@@ -1893,7 +2015,11 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         *,
         use_fused_ops: bool = False,
         swa_comm: str = "all_to_all_v",
+        indexer_load_balance: str = "none",
         main_kv_comm: str = "all_gather",
+        indexer_balance_block_size: int | None = None,
+        indexer_zigzag_min_length: int | None = None,
+        indexer_zigzag_min_chunk_size: int | None = None,
     ) -> None:
         """Transfer source state and select the implementation used for comparisons.
 
@@ -1908,6 +2034,17 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
                 device, without loading optional operator extensions.
             swa_comm: Raw KV communication, 'all_to_all_v' exchanges only the SWA
                 halo; 'all_gather' keeps the full-bank comparison.
+            indexer_load_balance: 'none', 'zigzag', 'greedy' or 'hybrid' query-task allocation.
+                Selection exchanges low-rank qr, merge weights and rotary embeddings;
+                attention and KL retain the original owner and autograd graph.
+            indexer_balance_block_size: Maximum original query rows per greedy task,
+                before adjacent tasks on one worker are merged. Greedy/hybrid default to 2048.
+                Explicit values require greedy/hybrid and must be positive and no larger
+                than local Q. Omit this option for none/zigzag.
+            indexer_zigzag_min_length: Explicit hybrid-only minimum document length in raw tokens.
+            indexer_zigzag_min_chunk_size: Explicit hybrid-only minimum floor(document length / (2*CP)).
+                Both thresholds must pass. Eligible head/tail fragments stay intact;
+                leading remainders and other documents share the greedy pool and row budget.
             main_kv_comm: 'all_to_all_v' dispatches document-causal main KV prefixes;
                 'all_gather' retains the full-bank comparison.
 
@@ -1930,6 +2067,12 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
             raise ValueError("swa_comm must be 'all_gather' or 'all_to_all_v'")
         if main_kv_comm not in ("all_gather", "all_to_all_v"):
             raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
+        indexer_balance_block_size = resolve_indexer_balance_block_size(
+            indexer_load_balance, indexer_balance_block_size,
+        )
+        validate_indexer_hybrid_thresholds(
+            indexer_load_balance, indexer_zigzag_min_length, indexer_zigzag_min_chunk_size,
+        )
         del module_fqn, context
         super().__init__(
             module,
@@ -1937,6 +2080,10 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
             use_fused_ops=use_fused_ops,
         )
         self.swa_comm = swa_comm
+        self.indexer_load_balance = indexer_load_balance
+        self.indexer_balance_block_size = indexer_balance_block_size
+        self.indexer_zigzag_min_length = indexer_zigzag_min_length
+        self.indexer_zigzag_min_chunk_size = indexer_zigzag_min_chunk_size
         self.main_kv_comm = main_kv_comm
 
 

@@ -35,14 +35,28 @@ from hyper_parallel.distributed.context_parallel.collectives import (
     async_cp_allgather_launch,
 )
 from hyper_parallel.distributed.context_parallel.compressed_document import CompressionBoundaryRoute
+from hyper_parallel.distributed.context_parallel.indexer_balance import (
+    balanced_indexer_select, launch_indexer_inputs, resolve_indexer_balance_block_size,
+    validate_indexer_hybrid_thresholds,
+)
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import async_sequence_dispatch
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
 
 
 def _build_shared_attention_cp_context(
-        cp_mesh: Any, swa_comm: str = "all_to_all_v", main_kv_comm: str = "all_gather",
+        cp_mesh: Any, swa_comm: str = "all_to_all_v", indexer_load_balance: str = "none",
+        main_kv_comm: str = "all_gather", indexer_balance_block_size: int | None = None,
+        indexer_zigzag_min_length: int | None = None, indexer_zigzag_min_chunk_size: int | None = None,
 ) -> SharedCompressedAttentionCPContext:
     """Build raw/main bank communication while keeping Index K globally gathered."""
+    indexer_balance_block_size = resolve_indexer_balance_block_size(
+        indexer_load_balance, indexer_balance_block_size,
+    )
+
+    validate_indexer_hybrid_thresholds(
+        indexer_load_balance, indexer_zigzag_min_length, indexer_zigzag_min_chunk_size,
+    )
+
     def _gather_sequence(tensor: torch.Tensor, sequence_dim: int) -> torch.Tensor:
         """All-gather one sequence dimension in CP-rank order."""
         return async_cp_allgather_launch(tensor, sequence_dim, cp_mesh).wait()
@@ -67,6 +81,22 @@ def _build_shared_attention_cp_context(
         """Exchange planned bank intervals on the existing CP group."""
         return async_sequence_dispatch(tensor, sequence_dim, route, cp_mesh.get_group())
 
+    def _balance_indexer(query_residual, weights, embeddings, selector, lengths, ratio):
+        """Move only selection tasks; differentiable banks and KL remain with owners."""
+        return balanced_indexer_select(
+            query_residual, weights, embeddings, selector, lengths, ratio, indexer_load_balance,
+            cp_mesh.get_group(), indexer_balance_block_size,
+            indexer_zigzag_min_length, indexer_zigzag_min_chunk_size,
+        )
+
+    def _launch_balance(query_residual, weights, embeddings, lengths, ratio):
+        """Launch no-grad selection inputs before independent owner projections."""
+        return launch_indexer_inputs(
+            query_residual, weights, embeddings, lengths, ratio, indexer_load_balance,
+            cp_mesh.get_group(), indexer_balance_block_size,
+            indexer_zigzag_min_length, indexer_zigzag_min_chunk_size,
+        )
+
     return SharedCompressedAttentionCPContext(
         size=cp_mesh.size(),
         rank=cp_mesh.get_local_rank(),
@@ -75,6 +105,8 @@ def _build_shared_attention_cp_context(
         exchange_boundary=_exchange_boundary,
         launch_raw=_launch_dispatch if swa_comm == "all_to_all_v" else None,
         launch_main=_launch_dispatch if main_kv_comm == "all_to_all_v" else None,
+        balance_indexer=_balance_indexer if indexer_load_balance != "none" else None,
+        launch_balance=_launch_balance if indexer_load_balance != "none" else None,
         indexer_priority=True,
     )
 
@@ -122,7 +154,9 @@ def deepseek_v41_shared_attention_parallel_wrapper(
     original_forward = target_module.forward
     cp_context = (
         _build_shared_attention_cp_context(
-            cp_mesh, target_module.swa_comm, target_module.main_kv_comm,
+            cp_mesh, target_module.swa_comm, target_module.indexer_load_balance, target_module.main_kv_comm,
+            target_module.indexer_balance_block_size,
+            target_module.indexer_zigzag_min_length, target_module.indexer_zigzag_min_chunk_size,
         )
         if cp_mesh is not None and cp_mesh.size() > 1
         else None

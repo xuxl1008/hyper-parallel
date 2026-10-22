@@ -51,7 +51,7 @@ from hyper_parallel.distributed.context_parallel.compressed_document import (
 )
 from hyper_parallel.distributed.context_parallel.index_key_dispatch import IndexKeyPlan
 from hyper_parallel.distributed.context_parallel.indexer_balance import (
-    resolve_indexer_balance_block_size, validate_indexer_hybrid_thresholds,
+    resolve_indexer_balance_block_size, validate_indexer_hybrid_threshold,
 )
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import (
     SequenceDispatchRoute, document_prefix_route, sliding_window_route,
@@ -449,8 +449,7 @@ class SharedCompressedPackedSequence:
 
 def _rotate_half(tensor: torch.Tensor) -> torch.Tensor:
     """Rotate adjacent real/imaginary pairs for V4 interleaved RoPE."""
-    first = tensor[..., 0::2]
-    second = tensor[..., 1::2]
+    first, second = tensor.unflatten(-1, (-1, 2)).unbind(-1)
     return torch.stack((-second, first), dim=-1).flatten(-2)
 
 
@@ -464,9 +463,9 @@ def _apply_v41_rope(
     cos = cos.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     sin = sin.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     rope_dim = cos.shape[-1]
-    pass_through, rotary = tensor[..., :-rope_dim], tensor[..., -rope_dim:]
+    pass_through, rotary = tensor.split((tensor.shape[-1] - rope_dim, rope_dim), dim=-1)
     rotary = ((rotary.float() * cos) + (_rotate_half(rotary).float() * sin)).to(tensor.dtype)
-    return torch.cat((pass_through, rotary), dim=-1)
+    return torch.cat((pass_through, rotary), dim=-1) if pass_through.shape[-1] else rotary
 
 
 def build_sliding_window_indices(
@@ -1142,6 +1141,7 @@ class SharedCompressedDSAIndexer(nn.Module):
 
     def _project_index_query(
             self, query_residual: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+            *, sequence_major: bool = False,
     ) -> torch.Tensor:
         """Project queries with their original rotary positions, including moved tasks."""
         query = self.q_b_proj(query_residual.detach())
@@ -1150,6 +1150,8 @@ class SharedCompressedDSAIndexer(nn.Module):
                 f"Indexer query width {query.shape[-1]} is not divisible by head_dim {self.head_dim}"
             )
         query = query.view(*query_residual.shape[:2], -1, self.head_dim)
+        if sequence_major:
+            return _apply_v41_rope(query, cos, sin, unsqueeze_dim=2)
         return _apply_v41_rope(query.transpose(1, 2), cos, sin).transpose(1, 2)
 
     def _project_index_key(
@@ -1321,7 +1323,7 @@ class SharedCompressedDSAIndexer(nn.Module):
     def _prepare_dispatched(self, wave: Any) -> tuple:
         """Expand received qr while Index K may still be in flight."""
         qr, weights, cos, sin = wave.wait()
-        query = self._project_index_query(qr, cos, sin)
+        query = self._project_index_query(qr, cos, sin, sequence_major=True)
         return query, weights, wave
 
     @torch.no_grad()
@@ -1364,8 +1366,15 @@ class SharedCompressedDSAIndexer(nn.Module):
 
             def select_tasks(task_qr: torch.Tensor, task_weights: torch.Tensor,
                              task_embeddings: tuple, segments: tuple) -> torch.Tensor:
-                """Project on the receiver while this layer's parameters are resident."""
-                task_query = self._project_index_query(task_qr, *task_embeddings)
+                """Project on the receiver while this layer's parameters are resident.
+
+                Args:
+                    task_qr: Low-rank query rows assigned to this worker.
+                    task_weights: Corresponding Indexer head weights.
+                    task_embeddings: Original-position cosine and sine rows.
+                    segments: Document-local causal ranges for the worker tasks.
+                """
+                task_query = self._project_index_query(task_qr, *task_embeddings, sequence_major=True)
                 return self._select_indices(
                     task_query, key, task_weights, None, 0, None, None, segments, key_plan,
                 )[0]
@@ -1582,7 +1591,8 @@ class SharedCompressedDSAAttentionBase(nn.Module):
     def _expand_query(self, query_residual: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """Expand main heads after low-rank query inputs have been dispatched."""
         query = self.q_b_proj(query_residual).view(*query_residual.shape[:2], -1, self.head_dim)
-        return _apply_v41_rope(query.transpose(1, 2), cos, sin)
+        # Preserve the heads-first interface as a view over the native sequence-first layout.
+        return _apply_v41_rope(query, cos, sin, unsqueeze_dim=2).transpose(1, 2)
 
     @staticmethod
     def _validate_forward_inputs(
@@ -1965,7 +1975,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             sequence_length: int,
     ) -> torch.Tensor:
         """Undo RoPE and apply the grouped low-rank output projection."""
-        attention_output = _apply_v41_rope(attention_output.transpose(1, 2), cos, -sin).transpose(1, 2)
+        attention_output = _apply_v41_rope(attention_output, cos, -sin, unsqueeze_dim=2)
         grouped = attention_output.reshape(batch_size, sequence_length, self.num_groups, -1)
         hidden_per_group = grouped.shape[-1]
         output_per_group = self.o_a_proj.weight.shape[0] // self.num_groups
@@ -2103,7 +2113,6 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         indexer_balance_block_size: int | None = None,
         index_k_comm: str = "all_gather",
         indexer_zigzag_min_length: int | None = None,
-        indexer_zigzag_min_chunk_size: int | None = None,
     ) -> None:
         """Transfer source state and select the implementation used for comparisons.
 
@@ -2126,9 +2135,9 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
                 Explicit values require greedy/hybrid and must be positive and no larger
                 than local Q. Omit this option for none/zigzag.
             indexer_zigzag_min_length: Explicit hybrid-only minimum document length in raw tokens.
-            indexer_zigzag_min_chunk_size: Explicit hybrid-only minimum floor(document length / (2*CP)).
-                Both thresholds must pass. Eligible head/tail fragments stay intact;
-                leading remainders and other documents share the greedy pool and row budget.
+                Eligible head/tail fragments stay intact; leading remainders and other documents
+                share the greedy pool and row budget. Documents shorter than 2*CP have no complete
+                zigzag fragments and enter the greedy pool.
             main_kv_comm: 'all_to_all_v' dispatches document-causal main KV prefixes;
                 'all_gather' retains the full-bank comparison.
             index_k_comm: 'all_to_all_v' exchanges the union of worker-LI and owner-KL
@@ -2159,8 +2168,8 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         indexer_balance_block_size = resolve_indexer_balance_block_size(
             indexer_load_balance, indexer_balance_block_size,
         )
-        validate_indexer_hybrid_thresholds(
-            indexer_load_balance, indexer_zigzag_min_length, indexer_zigzag_min_chunk_size,
+        validate_indexer_hybrid_threshold(
+            indexer_load_balance, indexer_zigzag_min_length,
         )
         del module_fqn, context
         super().__init__(
@@ -2172,7 +2181,6 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         self.indexer_load_balance = indexer_load_balance
         self.indexer_balance_block_size = indexer_balance_block_size
         self.indexer_zigzag_min_length = indexer_zigzag_min_length
-        self.indexer_zigzag_min_chunk_size = indexer_zigzag_min_chunk_size
         self.main_kv_comm = main_kv_comm
         self.index_k_comm = index_k_comm
 

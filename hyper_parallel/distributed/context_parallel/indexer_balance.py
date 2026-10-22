@@ -49,19 +49,23 @@ def resolve_indexer_balance_block_size(mode: str, block_size: int | None) -> int
     return (2048 if block_size is None else block_size) if mode in ("greedy", "hybrid") else None
 
 
-def validate_indexer_hybrid_thresholds(mode: str, min_length: int | None, min_chunk_size: int | None) -> None:
-    """Require explicit raw-token thresholds only when hybrid scheduling is enabled.
+def validate_indexer_hybrid_threshold(mode: str, min_length: int | None) -> None:
+    """Require an explicit raw-token document threshold only for hybrid scheduling.
 
-    These thresholds select complete zigzag fragments independently of the greedy
-    block size. No hardware-dependent performance threshold is chosen implicitly.
+    The threshold selects complete zigzag fragments independently of CP size and
+    the greedy block size. No performance threshold is chosen implicitly.
+
+    Args:
+        mode: Selected Indexer load-balancing strategy.
+        min_length: Explicit positive raw-token document threshold for hybrid.
     """
-    options = (("indexer_zigzag_min_length", min_length), ("indexer_zigzag_min_chunk_size", min_chunk_size))
-    for name, value in options:
-        if mode != "hybrid":
-            if value is not None:
-                raise ValueError(f"{name} requires indexer_load_balance='hybrid'")
-        elif not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            raise ValueError(f"indexer_load_balance='hybrid' requires an explicit positive integer {name}")
+    if mode != "hybrid":
+        if min_length is not None:
+            raise ValueError("indexer_zigzag_min_length requires indexer_load_balance='hybrid'")
+    elif not isinstance(min_length, int) or isinstance(min_length, bool) or min_length < 1:
+        raise ValueError(
+            "indexer_load_balance='hybrid' requires an explicit positive integer indexer_zigzag_min_length"
+        )
 
 
 @dataclass(frozen=True, order=True)
@@ -156,12 +160,15 @@ def _assign_greedy_tasks(assignments: list[list[IndexerTask]], tasks: list[Index
 
 
 def _hybrid_tasks(lengths: tuple[int, ...], size: int, ratio: int, block: int,
-                   min_length: int, min_chunk_size: int) -> list[list[IndexerTask]]:
-    """Keep eligible zigzag pairs intact and greedily allocate every remaining row."""
+                   min_length: int) -> list[list[IndexerTask]]:
+    """Keep eligible zigzag pairs intact and greedily allocate every remaining row.
+
+    Documents shorter than 2*size contain no complete pair and enter the greedy pool.
+    """
     assignments, pooled = [[] for _ in range(size)], []
     for document, length in enumerate(lengths):
         chunk, remainder = divmod(length, 2 * size)
-        if length >= min_length and chunk >= min_chunk_size:
+        if length >= min_length and chunk:
             for rank in range(size):
                 for slot in (rank, 2 * size - 1 - rank):
                     start = remainder + slot * chunk
@@ -191,8 +198,7 @@ def _validate_task_plan(lengths: tuple[int, ...], size: int, ratio: int, mode: s
 
 @lru_cache(maxsize=128)
 def indexer_task_plan(lengths: tuple[int, ...], size: int, ratio: int, mode: str,
-                      block_size: int | None = None, zigzag_min_length: int | None = None,
-                      zigzag_min_chunk_size: int | None = None) -> tuple:
+                      block_size: int | None = None, zigzag_min_length: int | None = None) -> tuple:
     """Assign real queries using zigzag, greedy or a shared-budget hybrid plan.
 
     Args:
@@ -208,20 +214,20 @@ def indexer_task_plan(lengths: tuple[int, ...], size: int, ratio: int, mode: str
             Explicit values require greedy/hybrid and must be positive and at most local Q
             to guarantee its per-worker row bound. Omit this option for zigzag.
         zigzag_min_length: Hybrid-only minimum document length in original tokens.
-            Must be specified explicitly together with zigzag_min_chunk_size.
-        zigzag_min_chunk_size: Hybrid-only minimum floor(document length / (2*CP)).
-            Eligible fragments remain whole, independently of block_size.
+            Must be specified explicitly. Eligible fragments remain whole,
+            independently of block_size. Documents shorter than 2*size enter the
+            greedy pool because they have no complete zigzag fragments.
 
     Returns:
         A sorted, disjoint task list for each rank. Greedy/hybrid cap each worker at
         twice the original local query count; zigzag preserves equal row counts.
     """
     block = _validate_task_plan(lengths, size, ratio, mode, block_size)
-    validate_indexer_hybrid_thresholds(mode, zigzag_min_length, zigzag_min_chunk_size)
+    validate_indexer_hybrid_threshold(mode, zigzag_min_length)
     if mode == "zigzag":
         assignments = _zigzag_tasks(lengths, size)
     elif mode == "hybrid":
-        assignments = _hybrid_tasks(lengths, size, ratio, block, zigzag_min_length, zigzag_min_chunk_size)
+        assignments = _hybrid_tasks(lengths, size, ratio, block, zigzag_min_length)
     else:
         assignments = _greedy_tasks(lengths, size, ratio, block)
     return tuple(_merge_tasks(tasks) for tasks in assignments)
@@ -341,21 +347,33 @@ class IndexerRoute:
 
 @lru_cache(maxsize=128)
 def indexer_route(lengths: tuple[int, ...], size: int, rank: int, ratio: int, mode: str,
-                  block_size: int | None = None, zigzag_min_length: int | None = None,
-                  zigzag_min_chunk_size: int | None = None) -> IndexerRoute:
-    """Keep self-owned tasks local and communicate the remaining rows in owner order."""
+                  block_size: int | None = None, zigzag_min_length: int | None = None) -> IndexerRoute:
+    """Keep self-owned tasks local and communicate the remaining rows in owner order.
+
+    Args:
+        lengths: Shared document lengths in raw tokens.
+        size: Number of ranks in the CP group.
+        rank: Current rank within the CP group.
+        ratio: Compression ratio used by the Indexer.
+        mode: Zigzag, greedy or hybrid task allocation.
+        block_size: Maximum initial greedy-pool task size in Q rows.
+        zigzag_min_length: Hybrid-only long-document threshold.
+
+    Returns:
+        Immutable input/result route with a local-task bypass.
+    """
     if not 0 <= rank < size:
         raise ValueError("Indexer balance rank must be inside its CP group")
     if mode == "zigzag":
         _validate_task_plan(lengths, size, ratio, mode, block_size)
-        validate_indexer_hybrid_thresholds(mode, zigzag_min_length, zigzag_min_chunk_size)
+        validate_indexer_hybrid_threshold(mode, zigzag_min_length)
         boundaries = (0, *accumulate(lengths))
         tasks = _zigzag_rank_tasks(lengths, size, rank)
         sends = _zigzag_send_ranges(lengths, size, rank, boundaries)
         receives = _receive_ranges(tasks, boundaries, size, boundaries[-1] // size)
         return _route_from_ranges(tasks, lengths, rank, ratio, sends, receives)
     assignments = indexer_task_plan(lengths, size, ratio, mode, block_size,
-                                    zigzag_min_length, zigzag_min_chunk_size)
+                                    zigzag_min_length)
     return _route_from_tasks(assignments, lengths, rank, ratio)
 
 
@@ -425,8 +443,7 @@ def _exchange_inputs(inputs: tuple[torch.Tensor, ...], route: IndexerRoute, grou
 def balanced_indexer_select(query_residual: torch.Tensor, weights: torch.Tensor,
                             position_embeddings: tuple[torch.Tensor, torch.Tensor], selector: Callable,
                             lengths: tuple[int, ...], ratio: int, mode: str, group: Any,
-                            block_size: int | None = None, zigzag_min_length: int | None = None,
-                            zigzag_min_chunk_size: int | None = None) -> torch.Tensor:
+                            block_size: int | None = None, zigzag_min_length: int | None = None) -> torch.Tensor:
     """Redistribute low-rank selection inputs and return TopK to the original owners.
 
     Args:
@@ -443,7 +460,6 @@ def balanced_indexer_select(query_residual: torch.Tensor, weights: torch.Tensor,
         group: Original sequence-ordered CP process group.
         block_size: Greedy task length in original query rows; see indexer_task_plan.
         zigzag_min_length: Hybrid-only minimum original document length.
-        zigzag_min_chunk_size: Hybrid-only minimum complete zigzag fragment length.
     """
     size, rank = dist.get_world_size(group), dist.get_rank(group)
     inputs = (query_residual, weights, *position_embeddings)
@@ -454,7 +470,7 @@ def balanced_indexer_select(query_residual: torch.Tensor, weights: torch.Tensor,
            or tensor.device != query_residual.device for tensor in inputs):
         raise ValueError("Indexer qr, weights and rotary embeddings must have matching batch/token axes and device")
     route = indexer_route(lengths, size, rank, ratio, mode, block_size,
-                           zigzag_min_length, zigzag_min_chunk_size)
+                           zigzag_min_length)
     rows = _device_rows(route, query_residual.device)
     balanced_qr, balanced_weights, cos, sin = _exchange_inputs(inputs, route, group, rows)
     selected = selector(balanced_qr, balanced_weights, (cos, sin), route.segments)[0]
@@ -541,7 +557,6 @@ def launch_indexer_inputs(
         query_residual: torch.Tensor, weights: torch.Tensor, embeddings: tuple,
         lengths: tuple[int, ...], ratio: int, mode: str, group: Any,
         block_size: int | None = None, zigzag_min_length: int | None = None,
-        zigzag_min_chunk_size: int | None = None,
 ) -> IndexerInputExchange:
     """Launch all selection input fields without waiting for worker readiness.
 
@@ -555,7 +570,6 @@ def launch_indexer_inputs(
         group: CP process group.
         block_size: Greedy task length in original query rows.
         zigzag_min_length: Hybrid long-document threshold.
-        zigzag_min_chunk_size: Hybrid minimum zigzag fragment.
 
     Returns:
         Single-use handle retaining transfer storage until wait.
@@ -569,7 +583,7 @@ def launch_indexer_inputs(
            or value.device != query_residual.device for value in inputs):
         raise ValueError("Indexer qr, weights and rotary embeddings must share token axes and device")
     route = indexer_route(lengths, size, rank, ratio, mode, block_size,
-                          zigzag_min_length, zigzag_min_chunk_size)
+                          zigzag_min_length)
     rows = _device_rows(route, query_residual.device)
     send_rows, receive_rows, local_sources, local_targets = rows
     grouped = {}

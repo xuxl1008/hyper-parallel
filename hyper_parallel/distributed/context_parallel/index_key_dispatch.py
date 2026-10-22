@@ -26,7 +26,7 @@ from hyper_parallel.distributed.context_parallel.compressed_document import (
     compressed_document_offsets, compressed_owner_offsets,
 )
 from hyper_parallel.distributed.context_parallel.indexer_balance import (
-    indexer_task_plan, resolve_indexer_balance_block_size, validate_indexer_hybrid_thresholds,
+    indexer_task_plan, resolve_indexer_balance_block_size, validate_indexer_hybrid_threshold,
 )
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import (
     SequenceDispatchGradient, SequenceDispatchRoute,
@@ -122,11 +122,11 @@ def _merge_zigzag_prefixes(demands: list[dict], lengths: tuple[int, ...], size: 
 
 def _index_key_demands(lengths: tuple[int, ...], size: int, ratio: int,
                         mode: str, block_size: int | None,
-                        zigzag_min_length: int | None, zigzag_min_chunk_size: int | None) -> tuple:
+                        zigzag_min_length: int | None) -> tuple:
     """Build transient global demands; only the current rank's resulting plan is cached."""
     _validate_key_layout(lengths, size, ratio)
     block_size = resolve_indexer_balance_block_size(mode, block_size)
-    validate_indexer_hybrid_thresholds(mode, zigzag_min_length, zigzag_min_chunk_size)
+    validate_indexer_hybrid_threshold(mode, zigzag_min_length)
     boundaries = (0, *accumulate(lengths))
     local = boundaries[-1] // size
     demands = [{} for _ in range(size)]
@@ -137,7 +137,7 @@ def _index_key_demands(lengths: tuple[int, ...], size: int, ratio: int,
         _merge_zigzag_prefixes(demands, lengths, size, ratio)
     elif mode in ("greedy", "hybrid"):
         assignments = indexer_task_plan(lengths, size, ratio, mode, block_size,
-                                        zigzag_min_length, zigzag_min_chunk_size)
+                                        zigzag_min_length)
         for rank, tasks in enumerate(assignments):
             for task in tasks:
                 demands[rank][task.document] = max(demands[rank].get(task.document, 0), task.end // ratio)
@@ -150,7 +150,7 @@ def _index_key_demands(lengths: tuple[int, ...], size: int, ratio: int,
 @lru_cache(maxsize=128)
 def index_key_plan(lengths: tuple[int, ...], size: int, rank: int, ratio: int,
                    mode: str = "none", block_size: int | None = None,
-                   zigzag_min_length: int | None = None, zigzag_min_chunk_size: int | None = None) -> IndexKeyPlan:
+                   zigzag_min_length: int | None = None) -> IndexKeyPlan:
     """Plan one compact Index K bank shared by Full and Reindex layers.
 
     Args:
@@ -161,13 +161,12 @@ def index_key_plan(lengths: tuple[int, ...], size: int, rank: int, ratio: int,
         mode: none/zigzag/greedy/hybrid query allocation, identical on all consumers.
         block_size: Greedy-pool query block option for greedy/hybrid.
         zigzag_min_length: Hybrid-only minimum original document length.
-        zigzag_min_chunk_size: Hybrid-only minimum complete zigzag fragment length.
 
     Returns:
         A cached metadata plan. It contains no current-step bank values or TopK results.
     """
     intervals = _index_key_demands(lengths, size, ratio, mode, block_size,
-                                   zigzag_min_length, zigzag_min_chunk_size)
+                                   zigzag_min_length)
     local = sum(lengths) // size
     boundaries = (0, *accumulate(lengths))
     owners = compressed_owner_offsets(boundaries, ratio, local)
@@ -181,7 +180,7 @@ def index_key_plan(lengths: tuple[int, ...], size: int, rank: int, ratio: int,
     owner_offset = (next(offset for start, _, offset in prefixes if start == owner_start)
                     if owner_start < owner_end else 0)
     signature = (lengths, size, rank, ratio, mode, resolve_indexer_balance_block_size(mode, block_size),
-                 zigzag_min_length, zigzag_min_chunk_size)
+                 zigzag_min_length)
     # Worker selection has no backward. Only the original Q owner's KL prefix contributes dK.
     gradient_route = replace(document_prefix_route(boundaries, local, size, rank, ratio), accumulate_fp32=True)
     gradient = SequenceDispatchGradient(gradient_route, owner_offset)

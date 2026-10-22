@@ -38,7 +38,7 @@ from hyper_parallel.distributed.context_parallel.compressed_document import Comp
 from hyper_parallel.distributed.context_parallel.index_key_dispatch import IndexKeyPlan, index_key_plan
 from hyper_parallel.distributed.context_parallel.indexer_balance import (
     balanced_indexer_select, launch_indexer_inputs, resolve_indexer_balance_block_size,
-    validate_indexer_hybrid_thresholds,
+    validate_indexer_hybrid_threshold,
 )
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import async_sequence_dispatch
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
@@ -48,7 +48,7 @@ def _build_shared_attention_cp_context(
         cp_mesh: Any, swa_comm: str = "all_to_all_v", indexer_load_balance: str = "none",
         main_kv_comm: str = "all_gather", indexer_balance_block_size: int | None = None,
         index_k_comm: str = "all_gather",
-        indexer_zigzag_min_length: int | None = None, indexer_zigzag_min_chunk_size: int | None = None,
+        indexer_zigzag_min_length: int | None = None,
 ) -> SharedCompressedAttentionCPContext:
     """Build independently configured raw, main and Index K bank communication."""
     if index_k_comm not in ("all_gather", "all_to_all_v"):
@@ -57,8 +57,8 @@ def _build_shared_attention_cp_context(
         indexer_load_balance, indexer_balance_block_size,
     )
 
-    validate_indexer_hybrid_thresholds(
-        indexer_load_balance, indexer_zigzag_min_length, indexer_zigzag_min_chunk_size,
+    validate_indexer_hybrid_threshold(
+        indexer_load_balance, indexer_zigzag_min_length,
     )
 
     def _gather_sequence(tensor: torch.Tensor, sequence_dim: int) -> torch.Tensor:
@@ -95,14 +95,14 @@ def _build_shared_attention_cp_context(
         """Cache the union of balanced-worker and original-owner prefix requirements."""
         return index_key_plan(lengths, cp_mesh.size(), cp_mesh.get_local_rank(), ratio,
                               indexer_load_balance, indexer_balance_block_size,
-                              indexer_zigzag_min_length, indexer_zigzag_min_chunk_size)
+                              indexer_zigzag_min_length)
 
     def _balance_indexer(query_residual, weights, embeddings, selector, lengths, ratio):
         """Move only selection tasks; differentiable banks and KL remain with owners."""
         return balanced_indexer_select(
             query_residual, weights, embeddings, selector, lengths, ratio, indexer_load_balance,
             cp_mesh.get_group(), indexer_balance_block_size,
-            indexer_zigzag_min_length, indexer_zigzag_min_chunk_size,
+            indexer_zigzag_min_length,
         )
 
     def _launch_balance(query_residual, weights, embeddings, lengths, ratio):
@@ -110,7 +110,7 @@ def _build_shared_attention_cp_context(
         return launch_indexer_inputs(
             query_residual, weights, embeddings, lengths, ratio, indexer_load_balance,
             cp_mesh.get_group(), indexer_balance_block_size,
-            indexer_zigzag_min_length, indexer_zigzag_min_chunk_size,
+            indexer_zigzag_min_length,
         )
 
     return SharedCompressedAttentionCPContext(
@@ -160,6 +160,16 @@ def deepseek_v41_shared_attention_parallel_wrapper(
     Main KV and Index K independently select document-prefix dispatch or all-gather.
     Launch/wait separation permits independent projection work. Indexer Q/merge heads remain TP-local and
     reduce their score and KL-target contributions before global Top-K.
+
+    Args:
+        target_module: Replaced V4.1 shared attention module.
+        mesh: Full device mesh supplied by the wrapper framework.
+        tp_mesh: Optional tensor-parallel submesh.
+        cp_mesh: Optional context-parallel submesh.
+        ep_mesh: Expert-parallel submesh, unused by this attention wrapper.
+
+    Returns:
+        Forward rewrite with explicit attention parallel contexts.
     """
     del mesh, ep_mesh
     wrapper_name = "deepseek_v41_shared_attention_parallel_wrapper"
@@ -174,7 +184,7 @@ def deepseek_v41_shared_attention_parallel_wrapper(
         _build_shared_attention_cp_context(
             cp_mesh, target_module.swa_comm, target_module.indexer_load_balance, target_module.main_kv_comm,
             target_module.indexer_balance_block_size, target_module.index_k_comm,
-            target_module.indexer_zigzag_min_length, target_module.indexer_zigzag_min_chunk_size,
+            target_module.indexer_zigzag_min_length,
         )
         if cp_mesh is not None and cp_mesh.size() > 1
         else None

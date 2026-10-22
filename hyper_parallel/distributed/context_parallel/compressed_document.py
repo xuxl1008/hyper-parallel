@@ -76,6 +76,42 @@ def compressed_owner_offsets(boundaries: tuple[int, ...], ratio: int, local_leng
     return (*offsets, keys[-1])
 
 
+class _UniqueCompressionRows(torch.autograd.Function):
+    """Gather the non-overlapping rows of one document compression plan."""
+
+    @staticmethod
+    def forward(ctx: Any, source: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+        """Save only the source shape and the plan's unique row indices.
+
+        Args:
+            ctx: Autograd context holding the shape and row indices.
+            source: Projected rows, including any exchanged boundary payload.
+            rows: Unique compression row indices in source token coordinates.
+
+        Returns:
+            Selected rows in compression-block order.
+        """
+        ctx.source_shape = source.shape
+        ctx.save_for_backward(rows)
+        return source.index_select(1, rows)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Write this node's contribution; autograd accumulates other consumers.
+
+        Args:
+            ctx: Autograd context saved by forward.
+            grad_output: Upstream gradient for the selected compression rows.
+
+        Returns:
+            Source gradient and no gradient for integer row indices.
+        """
+        rows, = ctx.saved_tensors
+        grad_source = grad_output.new_zeros(ctx.source_shape)
+        grad_source.index_copy_(1, rows, grad_output)
+        return grad_source, None
+
+
 @dataclass(frozen=True)
 class DocumentCompressionPlan:
     """Immutable block ranges; never enumerate the full sequence on the CPU."""
@@ -100,12 +136,23 @@ class DocumentCompressionPlan:
         return context.exchange_boundary(tensor, self.route)
 
     def pool(self, key: torch.Tensor, gate: torch.Tensor, context: Any) -> torch.Tensor:
-        """Pool complete same-document groups using the model's original FP32 softmax."""
+        """Pool complete same-document groups using the model's original FP32 softmax.
+
+        Args:
+            key: Locally projected values before pooling.
+            gate: Locally projected per-channel pooling logits.
+            context: CP context used to exchange cross-rank boundary rows.
+
+        Returns:
+            Pooled values for complete blocks owned by this rank.
+        """
         rows = self.indices(key.device)[0]
         projected = self.exchange(torch.cat((key, gate), dim=-1), context)
-        blocks = projected.index_select(1, rows).reshape(
-            key.shape[0], self.counts[self.rank], self.ratio, projected.shape[-1],
-        )
+        # Complete document blocks never overlap, so this pool needs no repeated-row reduction.
+        # Keep the native path for other dtypes: FP32 index_copy uses more temporary memory.
+        selected = (_UniqueCompressionRows.apply(projected, rows) if projected.dtype == torch.bfloat16
+                    else projected.index_select(1, rows))
+        blocks = selected.reshape(key.shape[0], self.counts[self.rank], self.ratio, projected.shape[-1])
         values, scores = blocks.chunk(2, dim=-1)
         return (values * scores.float().softmax(dim=2).to(values.dtype)).sum(dim=2)
 

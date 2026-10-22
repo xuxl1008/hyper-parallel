@@ -41,7 +41,6 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4PreTrainedModel,
     DeepseekV4RMSNorm,
     DeepseekV4RotaryEmbedding,
-    apply_rotary_pos_emb,
 )
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
@@ -63,6 +62,7 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedDSAAttention,
     SharedCompressedDSAAttentionBase,
     SharedCompressedDSAIndexer,
+    _apply_v41_rope,
 )
 from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE,
@@ -442,13 +442,13 @@ class DeepseekV41Compressor(nn.Module):
         if self.compress_ratio == 1:
             latent = self.norm(self.wkv(hidden_states))
             cos, sin = compress_position_embeddings
-            rotated = apply_rotary_pos_emb(latent.unsqueeze(1), cos, sin).squeeze(1)
+            rotated = _apply_v41_rope(latent.unsqueeze(1), cos, sin).squeeze(1)
             return latent, rotated
 
         if block_plan is not None:
             latent = self.norm(block_plan.pool(self.wkv(hidden_states), self.wgate(hidden_states), cp_context))
             cos, sin = compress_position_embeddings
-            return latent, apply_rotary_pos_emb(
+            return latent, _apply_v41_rope(
                 latent.unsqueeze(1), cos, sin,
             ).squeeze(1)
 
@@ -461,7 +461,7 @@ class DeepseekV41Compressor(nn.Module):
         cos, sin = compress_position_embeddings
         cos = cos[:, :usable:self.compress_ratio]
         sin = sin[:, :usable:self.compress_ratio]
-        rotated = apply_rotary_pos_emb(latent.unsqueeze(1), cos, sin).squeeze(1)
+        rotated = _apply_v41_rope(latent.unsqueeze(1), cos, sin).squeeze(1)
         return latent, rotated
 
 

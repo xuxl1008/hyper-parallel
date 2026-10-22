@@ -48,6 +48,7 @@ class SequenceDispatchRoute:
     output_splits: tuple[int, ...]
     needs_exchange: bool
     send_ranges: tuple[tuple[int, int], ...] = ()
+    accumulate_fp32: bool = False
 
     def owner_ranges(self) -> tuple[tuple[int, int], ...]:
         """Return send slices in destination-rank order, including multi-range peers."""
@@ -105,7 +106,7 @@ def _receive_counts(intervals: tuple, owners: tuple, rank: int) -> tuple[int, ..
 
 
 def multi_interval_route(local_length: int, rank: int, intervals: tuple[tuple, ...],
-                         *,
+                         *, accumulate_fp32: bool = False,
                          owner_offsets: tuple[int, ...] | None = None) -> SequenceDispatchRoute:
     """Plan compact demands, retaining each owner's complete, possibly empty shard.
 
@@ -113,6 +114,7 @@ def multi_interval_route(local_length: int, rank: int, intervals: tuple[tuple, .
         local_length: Physical K rows on this source rank.
         rank: Local rank in the sequence-ordered group.
         intervals: Sorted, disjoint global ranges required by each destination.
+        accumulate_fp32: Sum half-precision consumer gradients in FP32 at owners.
         owner_offsets: Canonical source boundaries; omitted for equal-sized shards.
     """
     size = len(intervals)
@@ -131,8 +133,26 @@ def multi_interval_route(local_length: int, rank: int, intervals: tuple[tuple, .
         local_length, requested[0][0] if requested else local_start,
         requested[-1][1] if requested else local_start, sum(receives[:rank]),
         (0,) * size, tuple(sum(count for _, count in ranges) for ranges in sends), receives,
-        needs_exchange, tuple(item for ranges in sends for item in ranges),
+        needs_exchange, tuple(item for ranges in sends for item in ranges), accumulate_fp32,
     )
+
+
+@dataclass(frozen=True)
+class SequenceDispatchGradient:
+    """Reverse route for a contiguous differentiable slice of a dispatched bank.
+
+    Rows outside this slice must only be used without gradients. This permits
+    Indexer selection to request more K rows than the original owner's KL needs.
+    The selected route still covers the source rank's complete local K shard.
+    """
+
+    route: SequenceDispatchRoute
+    start: int
+
+    @property
+    def length(self) -> int:
+        """Number of differentiable rows, including the local bypass."""
+        return self.route.local_length + sum(self.route.output_splits)
 
 
 class _SequenceDispatchWait(torch.autograd.Function):
@@ -140,9 +160,10 @@ class _SequenceDispatchWait(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: Any, local: torch.Tensor, received: torch.Tensor, work: Any,
-                route: SequenceDispatchRoute, group: Any) -> torch.Tensor:
+                route: SequenceDispatchRoute, group: Any, gradient: SequenceDispatchGradient | None) -> torch.Tensor:
         """Wait before exposing received data and insert the uncommunicated local rows."""
         ctx.route = route
+        ctx.gradient = gradient
         ctx.group = group
         work.wait()
         before = route.local_output_start
@@ -152,21 +173,29 @@ class _SequenceDispatchWait(torch.autograd.Function):
     def backward(ctx: Any, grad: torch.Tensor) -> tuple:
         """Reverse dispatch, SUMming consumers in rank order, including empty ranks."""
         route = ctx.route
+        if ctx.gradient is not None:
+            route = ctx.gradient.route
+            grad = grad.narrow(0, ctx.gradient.start, ctx.gradient.length)
         first, last = route.local_output_start, route.local_output_start + route.local_length
+        if not route.needs_exchange:
+            # Do not retain the larger selection bank through a local-gradient view.
+            return grad[first:last].clone(memory_format=torch.contiguous_format), None, None, None, None, None
         send = torch.cat((grad[:first], grad[last:]), dim=0)
         received = grad.new_empty((sum(route.input_splits), *grad.shape[1:]))
         work = dist.all_to_all_single(
             received, send, output_split_sizes=list(route.input_splits),
             input_split_sizes=list(route.output_splits), group=ctx.group, async_op=True,
         )
-        local = grad[first:last].clone(memory_format=torch.contiguous_format)
+        accumulation_dtype = (torch.float32 if route.accumulate_fp32 and grad.dtype in (torch.float16, torch.bfloat16)
+                              else grad.dtype)
+        local = grad[first:last].to(dtype=accumulation_dtype, copy=True).contiguous()
         work.wait()
         cursor = 0
         for offset, count in route.owner_ranges():
             if count:
                 local.narrow(0, offset, count).add_(received.narrow(0, cursor, count))
                 cursor += count
-        return local, None, None, None, None
+        return local.to(grad.dtype), None, None, None, None, None
 
 
 @dataclass
@@ -180,6 +209,7 @@ class AsyncSequenceDispatch:
     route: SequenceDispatchRoute
     group: Any
     sequence_dim: int
+    gradient: SequenceDispatchGradient | None = None
     waited: bool = False
 
     def wait(self) -> torch.Tensor:
@@ -190,7 +220,7 @@ class AsyncSequenceDispatch:
         output = self.local
         if self.received is not None:
             output = _SequenceDispatchWait.apply(
-                self.local, self.received, self.work, self.route, self.group,
+                self.local, self.received, self.work, self.route, self.group, self.gradient,
             )
         self.send = None
         self.received = None
@@ -198,7 +228,8 @@ class AsyncSequenceDispatch:
 
 
 def async_sequence_dispatch(tensor: torch.Tensor, sequence_dim: int,
-                            route: SequenceDispatchRoute, group: Any) -> AsyncSequenceDispatch:
+                            route: SequenceDispatchRoute, group: Any, *,
+                            gradient: SequenceDispatchGradient | None = None) -> AsyncSequenceDispatch:
     """Launch variable row exchange with an autograd edge attached at wait.
 
     Args:
@@ -206,15 +237,23 @@ def async_sequence_dispatch(tensor: torch.Tensor, sequence_dim: int,
         sequence_dim: Sequence dimension; feature dimensions are transported unchanged.
         route: Immutable per-batch routing agreed by every member of the CP group.
         group: Existing framework-owned CP process group, in sequence-shard rank order.
+        gradient: Optional restricted reverse route; all other output rows must have zero gradient.
     """
     if not -tensor.ndim <= sequence_dim < tensor.ndim:
         raise ValueError("sequence dispatch dimension is outside the input tensor dimensions")
     sequence_dim %= tensor.ndim
     if tensor.shape[sequence_dim] != route.local_length:
         raise ValueError("sequence dispatch owner length does not match the bank's physical layout")
+    if gradient is not None:
+        total = route.local_length + sum(route.output_splits)
+        if (gradient.route.local_length != route.local_length or gradient.start < 0
+                or gradient.start + gradient.length > total
+                or (route.local_length and
+                    gradient.start + gradient.route.local_output_start != route.local_output_start)):
+            raise ValueError("Dispatch gradient slice must retain the complete local shard in its original position")
     local = tensor.movedim(sequence_dim, 0).contiguous()
     if not route.needs_exchange:
-        return AsyncSequenceDispatch(local, None, None, None, route, group, sequence_dim)
+        return AsyncSequenceDispatch(local, None, None, None, route, group, sequence_dim, gradient)
     parts = [local.detach().narrow(0, offset, count)
              for offset, count in route.owner_ranges() if count]
     send = torch.cat(parts, dim=0) if parts else local.detach()[:0]
@@ -223,7 +262,7 @@ def async_sequence_dispatch(tensor: torch.Tensor, sequence_dim: int,
         received, send, output_split_sizes=list(route.output_splits),
         input_split_sizes=list(route.input_splits), group=group, async_op=True,
     )
-    return AsyncSequenceDispatch(local, send, received, work, route, group, sequence_dim)
+    return AsyncSequenceDispatch(local, send, received, work, route, group, sequence_dim, gradient)
 
 
 @lru_cache(maxsize=128)

@@ -43,7 +43,7 @@ from torch import nn
 from torch.nn import functional as F
 
 
-_KDA_BACKENDS = frozenset({"eager", "triton"})
+_KDA_BACKENDS = frozenset({"eager", "triton", "ascendc"})
 _TRITON_KDA_HEAD_DIM = 128
 _TRITON_KDA_CHUNK_SIZE = 64
 
@@ -526,7 +526,7 @@ def chunk_kda(
     chunk_size: int = 64,
     backend: str = "eager",
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Dispatch KDA to an explicitly selected eager or Triton backend."""
+    """Dispatch KDA to an explicitly selected eager, Triton or AscendC backend."""
     backend = backend.lower()
     if backend not in _KDA_BACKENDS:
         raise ValueError(
@@ -551,6 +551,20 @@ def chunk_kda(
             lower_bound=lower_bound,
             chunk_size=chunk_size,
         )
+    if backend == "ascendc":
+        if initial_state is not None or output_final_state:
+            raise NotImplementedError("AscendC KDA adapter currently supports stateless local/Ulysses training only.")
+        if not (use_qk_l2norm_in_kernel and use_gate_in_kernel and use_beta_sigmoid_in_kernel):
+            raise NotImplementedError("AscendC KDA adapter requires Q/K normalization, safe gate and beta sigmoid.")
+        from hyper_parallel.components.functional.kimi_delta_attention_ascendc_adapter import (  # pylint: disable=import-outside-toplevel
+            ascendc_chunk_kda,
+        )
+        return ascendc_chunk_kda(
+            query, key, value, gate, beta,
+            a_log=a_log.float() if a_log is not None else None,
+            dt_bias=dt_bias.float() if dt_bias is not None else None,
+            scale=scale, lower_bound=lower_bound, chunk_size=chunk_size,
+        ), None
     if initial_state is not None or output_final_state:
         raise NotImplementedError(
             "KDA backend='triton' currently supports zero initial state without "

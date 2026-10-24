@@ -1,0 +1,386 @@
+diff --git a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/README.md b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/README.md
+index 9c0a594d..b7db0310 100644
+--- a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/README.md
++++ b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/README.md
+@@ -1,6 +1,12 @@
+ # ChunkGatedDeltaRuleBwdDhu 算子说明
+ `ChunkGatedDeltaRuleBwdDhu` 是一个用于分块门控 delta 规则（Chunk Gated Delta Rule）反向传播过程中的自定义算子。该算子沿时间轴反向扫描，根据前向激活值及上游梯度，计算隐藏状态梯度（dh）、初始隐藏状态梯度（dh0）以及更新后的 Value 梯度（dv2）。
+ 
++> 本实验分支增加 A2 K-first 非零 dHT 和 FP32 boundary 支持。FP32 h0/dHT/dH0
++> 使用同一 dtype，token/dh/dv2 仍为 BF16/FP16；FP32 dHT 暂要求显式 h0。
++> 非空 dHT 的 V-first 输入、FP32 A5 输入显式拒绝。A3 未实机验收。
++> 以下原始接口表的 token-boundary 限制保留作为上游基线说明，新增范围与验证以
++> [本地验证记录](docs/validation.md) 为准；这不是上游已发布的能力声明。
++
+ ---
+ 
+ ## 1. 算子功能
+diff --git a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_host/chunk_gated_delta_rule_bwd_dhu_def.cpp b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_host/chunk_gated_delta_rule_bwd_dhu_def.cpp
+index 1650ccf4..ebe8670a 100644
+--- a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_host/chunk_gated_delta_rule_bwd_dhu_def.cpp
++++ b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_host/chunk_gated_delta_rule_bwd_dhu_def.cpp
+@@ -22,15 +22,23 @@ public:
+     {
+         const std::initializer_list<ge::DataType> dataTypes = {
+             ge::DT_BF16, ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT16,
++            ge::DT_BF16, ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT16,
++        };
++        const std::initializer_list<ge::DataType> stateTypes = {
++            ge::DT_BF16, ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT16,
++            ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_FLOAT,
+         };
+         const std::initializer_list<ge::DataType> gateTypes = {
+             ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_BF16, ge::DT_FLOAT16,
++            ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_BF16, ge::DT_FLOAT16,
+         };
+         const std::initializer_list<ge::DataType> indexTypes = {
+             ge::DT_INT64, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
++            ge::DT_INT64, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
+         };
+         const std::initializer_list<ge::Format> formats = {
+             ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,
++            ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,
+         };
+ 
+         this->Input("q")
+@@ -77,13 +85,13 @@ public:
+             .AutoContiguous();
+         this->Input("h0")
+             .ParamType(OPTIONAL)
+-            .DataType(dataTypes)
++            .DataType(stateTypes)
+             .Format(formats)
+             .UnknownShapeFormat(formats)
+             .AutoContiguous();
+         this->Input("dht")
+             .ParamType(OPTIONAL)
+-            .DataType(dataTypes)
++            .DataType(stateTypes)
+             .Format(formats)
+             .UnknownShapeFormat(formats)
+             .AutoContiguous();
+@@ -109,7 +117,7 @@ public:
+             .UnknownShapeFormat(formats);
+         this->Output("dh0")
+             .ParamType(REQUIRED)
+-            .DataType(dataTypes)
++            .DataType(stateTypes)
+             .Format(formats)
+             .UnknownShapeFormat(formats);
+         this->Output("dv2")
+diff --git a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_host/op_api/aclnn_chunk_gated_delta_rule_bwd_dhu.cpp b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_host/op_api/aclnn_chunk_gated_delta_rule_bwd_dhu.cpp
+index 8ad3cfa1..1aea373b 100644
+--- a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_host/op_api/aclnn_chunk_gated_delta_rule_bwd_dhu.cpp
++++ b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_host/op_api/aclnn_chunk_gated_delta_rule_bwd_dhu.cpp
+@@ -81,6 +81,8 @@ static aclnnStatus CheckNotNull(ChunkGatedDeltaRuleBwdDhuParams params)
+         CHECK_COND(params.dh0Out != nullptr, ACLNN_ERR_PARAM_NULLPTR, "dh0Out must not be nullptr when h0Optional is not nullptr.");
+     }
+     CHECK_COND(params.dv2Out != nullptr, ACLNN_ERR_PARAM_NULLPTR, "dv2Out must not be nullptr.");
++    CHECK_COND(params.dhtOptional == nullptr || !params.stateVFirst, ACLNN_ERR_PARAM_INVALID,
++               "Experimental nonzero dht support requires K-first state layout.");
+     return ACLNN_SUCCESS;
+ }
+ 
+@@ -239,7 +241,8 @@ static aclnnStatus CheckShape(ChunkGatedDeltaRuleBwdDhuParams params)
+ static aclnnStatus CheckDtype(ChunkGatedDeltaRuleBwdDhuParams params)
+ {
+     // 与 def.cpp 动态 dtype 组一致）：
+-    // q/k/w/dO/dv/h0/dht/dhOut/dh0Out/dv2Out 与 q 同 dtype ∈ {BF16, FP16}；g/gk ∈ {FP32, 与 q 同}
++    // q/k/w/dO/dv/dhOut/dv2Out 与 q 同 dtype ∈ {BF16, FP16}；g/gk ∈ {FP32, 与 q 同}
++    // h0/dht/dh0Out 边界使用同一 dtype，可为 FP32 或与 q 相同。
+     const ge::DataType inputDtype = params.q->GetDataType();
+     CHECK_COND(inputDtype == ge::DT_BF16 || inputDtype == ge::DT_FLOAT16, ACLNN_ERR_PARAM_INVALID,
+                "q dtype should be bfloat16 or float16.");
+@@ -262,11 +265,12 @@ static aclnnStatus CheckDtype(ChunkGatedDeltaRuleBwdDhuParams params)
+     CHECK_COND(gateDtype == ge::DT_FLOAT || gateDtype == inputDtype, ACLNN_ERR_PARAM_INVALID,
+                "g/gk dtype should be float32 or same as q.");
+     if (params.h0Optional != nullptr) {
+-        CHECK_COND(params.h0Optional->GetDataType() == inputDtype, ACLNN_ERR_PARAM_INVALID,
+-                   "h0 dtype should be same as q.");
++        CHECK_COND(params.h0Optional->GetDataType() == inputDtype ||
++                       params.h0Optional->GetDataType() == ge::DT_FLOAT, ACLNN_ERR_PARAM_INVALID,
++                   "h0 dtype should be FP32 or same as q.");
+         if (params.dh0Out != nullptr) {
+-            CHECK_COND(params.dh0Out->GetDataType() == inputDtype, ACLNN_ERR_PARAM_INVALID,
+-                       "dh0Out dtype should be same as q.");
++            CHECK_COND(params.dh0Out->GetDataType() == params.h0Optional->GetDataType(), ACLNN_ERR_PARAM_INVALID,
++                       "dh0Out dtype should be same as h0.");
+         }
+     } else {
+         // dh0 仅在提供 h0 时写出
+@@ -274,9 +278,12 @@ static aclnnStatus CheckDtype(ChunkGatedDeltaRuleBwdDhuParams params)
+                    "dh0Out requires h0 to be provided.");
+     }
+     if (params.dhtOptional != nullptr) {
+-        CHECK_COND(params.dhtOptional->GetDataType() == inputDtype, ACLNN_ERR_PARAM_INVALID,
+-                   "dht dtype should be same as q.");
++        const auto stateType = params.h0Optional != nullptr ? params.h0Optional->GetDataType() : inputDtype;
++        CHECK_COND(params.dhtOptional->GetDataType() == stateType, ACLNN_ERR_PARAM_INVALID,
++                   "dht dtype should match h0, or q when h0 is absent.");
+     }
++    CHECK_COND(params.h0Optional == nullptr || params.h0Optional->GetDataType() != ge::DT_FLOAT ||
++                   !params.stateVFirst, ACLNN_ERR_PARAM_INVALID, "FP32 boundaries require K-first layout.");
+     return ACLNN_SUCCESS;
+ }
+ 
+diff --git a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_host/op_tiling/chunk_gated_delta_rule_bwd_dhu_tiling.cpp b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_host/op_tiling/chunk_gated_delta_rule_bwd_dhu_tiling.cpp
+index 347980f6..34141baa 100644
+--- a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_host/op_tiling/chunk_gated_delta_rule_bwd_dhu_tiling.cpp
++++ b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_host/op_tiling/chunk_gated_delta_rule_bwd_dhu_tiling.cpp
+@@ -129,6 +129,12 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleBwdDhu(gert::TilingContext *context)
+ 
+     ChunkGatedDeltaRuleBwdDhuTilingProcessor processor(ctx, *tiling);
+     OP_CHECK_IF(processor.Process() != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
++    auto h0Desc = context->GetOptionalInputDesc(CGDR_BWD_DHU_INPUT_H0_IDX);
++    tiling->boundaryFp32 = h0Desc != nullptr && h0Desc->GetDataType() == ge::DT_FLOAT;
++    // The experimental FP32 boundary implementation is confined to A2/A3.
++    OP_CHECK_IF(tiling->boundaryFp32 &&
++                    (ascendcPlatform.GetCurNpuArch() == NpuArch::DAV_3510 || tiling->stateVFirst),
++                , return ge::GRAPH_FAILED);
+ 
+     context->SetTilingKey(processor.GetTilingKey());
+     context->SetBlockDim(processor.GetBlockDim());
+diff --git a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_kernel/chunk_gated_delta_rule_bwd_dhu.cpp b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_kernel/chunk_gated_delta_rule_bwd_dhu.cpp
+index f25539e6..fdb0c434 100644
+--- a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_kernel/chunk_gated_delta_rule_bwd_dhu.cpp
++++ b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_kernel/chunk_gated_delta_rule_bwd_dhu.cpp
+@@ -31,7 +31,7 @@ namespace GDN {
+ 
+ template <typename DT, typename GT, int V_DIM, int USE_GK>
+ __aicore__ inline void ChunkGatedDeltaRuleBwdDhuKernelImpl(
+-    GM_ADDR q, GM_ADDR k, GM_ADDR w, GM_ADDR d_o, GM_ADDR dv, GM_ADDR gate,
++    GM_ADDR q, GM_ADDR k, GM_ADDR w, GM_ADDR d_o, GM_ADDR dv, GM_ADDR gate, GM_ADDR dht,
+     GM_ADDR cu_seqlens, GM_ADDR chunk_indices, GM_ADDR dh, GM_ADDR dh0, GM_ADDR dv2,
+     GM_ADDR workspace, const ChunkGatedDeltaRuleBwdDhuTilingData *tilingData)
+ {
+@@ -43,7 +43,11 @@ __aicore__ inline void ChunkGatedDeltaRuleBwdDhuKernelImpl(
+     if ASCEND_IS_AIV {
+         AscendC::TPipe pipe;
+         ChunkGatedDeltaRuleBwdDhuVector<DT, GT, USE_GK> vec;
++#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+         vec.Init(q, gate, dv, cu_seqlens, chunk_indices, dh, dh0, dv2, workspace, tilingData, &pipe);
++#else
++        vec.Init(q, gate, dv, dht, cu_seqlens, chunk_indices, dh, dh0, dv2, workspace, tilingData, &pipe);
++#endif
+         vec.Process();
+     }
+ }
+@@ -76,7 +80,6 @@ __global__ __aicore__ void chunk_gated_delta_rule_bwd_dhu(
+     GM_ADDR dh, GM_ADDR dh0, GM_ADDR dv2, GM_ADDR workspace, GM_ADDR tiling)
+ {
+     (void)h0;
+-    (void)dht;
+ 
+     AscendC::AscendCUtils::SetOverflow(1);
+ 
+@@ -93,6 +96,6 @@ __global__ __aicore__ void chunk_gated_delta_rule_bwd_dhu(
+     using GType = typename GDN::ChunkGatedDeltaRuleBwdDhuDTypeTraits<D_T_G>::type;
+     GM_ADDR gate = (USE_GK == 0) ? g : gk;
+     GDN::ChunkGatedDeltaRuleBwdDhuKernelImpl<QType, GType, V, USE_GK>(
+-        q, k, w, d_o, dv, gate, cu_seqlens, chunk_indices, dh, dh0, dv2, userWS, &tilingData);
++        q, k, w, d_o, dv, gate, dht, cu_seqlens, chunk_indices, dh, dh0, dv2, userWS, &tilingData);
+ }
+ #endif
+diff --git a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_kernel/chunk_gated_delta_rule_bwd_dhu_struct.h b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_kernel/chunk_gated_delta_rule_bwd_dhu_struct.h
+index 2886aece..f3f3dae2 100644
+--- a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_kernel/chunk_gated_delta_rule_bwd_dhu_struct.h
++++ b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_kernel/chunk_gated_delta_rule_bwd_dhu_struct.h
+@@ -104,6 +104,7 @@ struct ChunkGatedDeltaRuleBwdDhuTilingData {
+     int64_t termWWorkspaceElems;
+     int64_t vecRow;
+     int64_t stateResident;
++    int64_t boundaryFp32;
+     float scale;
+ };
+ 
+diff --git a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_kernel/chunk_gated_delta_rule_bwd_dhu_vector.h b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_kernel/chunk_gated_delta_rule_bwd_dhu_vector.h
+index 4661a765..82de1c83 100644
+--- a/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_kernel/chunk_gated_delta_rule_bwd_dhu_vector.h
++++ b/fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu/op_kernel/chunk_gated_delta_rule_bwd_dhu_vector.h
+@@ -30,7 +30,7 @@ class ChunkGatedDeltaRuleBwdDhuVector {
+ public:
+     __aicore__ inline ChunkGatedDeltaRuleBwdDhuVector() = default;
+ 
+-    __aicore__ inline void Init(GM_ADDR q, GM_ADDR gate, GM_ADDR dv, GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR dh,
++    __aicore__ inline void Init(GM_ADDR q, GM_ADDR gate, GM_ADDR dv, GM_ADDR dht, GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR dh,
+                                 GM_ADDR dh0, GM_ADDR dv2, GM_ADDR workspace,
+                                 const ChunkGatedDeltaRuleBwdDhuTilingData *__restrict tilingData,
+                                 AscendC::TPipe *pipe)
+@@ -38,6 +38,12 @@ public:
+         qGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(q));
+         gateGm_.SetGlobalBuffer(reinterpret_cast<__gm__ GT *>(gate));
+         dvGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(dv));
++        hasDht_ = dht != nullptr;
++        boundaryFp32_ = tilingData->boundaryFp32 != 0;
++        if (hasDht_) {
++            dhtGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(dht));
++            dhtFp32Gm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(dht));
++        }
+         cuSeqlens_ = cuSeqlens;
+         chunkIndices_ = chunkIndices;
+         // q/g/dv 均为一次性流式读，禁 L2 防止写分配驱逐 dh/dv2 及 qg/termQ/termW
+@@ -53,6 +59,7 @@ public:
+         dhGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(dh));
+         if (tilingData->hasDh0 != 0 && dh0 != nullptr) {
+             dh0Gm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(dh0));
++            dh0Fp32Gm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(dh0));
+             dh0Addr_ = dh0;
+             hasDh0_ = true;
+         }
+@@ -143,7 +150,7 @@ public:
+                     clearElems = dh0ClearTailElems_;
+                 }
+                 if (clearElems > 0) {
+-                    if constexpr (sizeof(DT) == sizeof(uint16_t)) {
++                    if (!boundaryFp32_) {
+                         AscendC::GlobalTensor<uint16_t> dh0ClearGm;
+                         dh0ClearGm.SetGlobalBuffer(
+                             reinterpret_cast<__gm__ uint16_t *>(dh0Addr_) + clearOffset);
+@@ -179,6 +186,11 @@ public:
+             // 变长前缀增量缓存（taskIdx 递增 → seqIdx 单调不减）
+             GetSeqInfoCached(cuSeqlens_, *tiling_, seqIdx, seqInfoCache_, seqInfo);
+             if (!seqInfo.valid) {
++                // An empty sequence is the identity map, with no cube work or
++                // cross-core messages. Its boundary adjoint must not be cleared.
++                if (hasDht_ && hasDh0_ && seqInfo.tokenStart == seqInfo.tokenEnd) {
++                    CopyEmptySequenceGradient(seqIdx, hvBase, headCnt);
++                }
+                 continue;
+             }
+ 
+@@ -194,7 +206,12 @@ public:
+                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(stateVToMte2Event_[stateIdx]);
+                     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(stateMte3ToMte2Event_[stateIdx]);
+                     AscendC::LocalTensor<float> stateFp32 = stateBuf_[stateIdx];
+-                    AscendC::Duplicate(stateFp32, 0.0f, elems);
++                    if (hasDht_) {
++                        const int64_t stateOffset = ((seqIdx * HV_ + hvBase + headOffset) * K_ + rowOffset) * V_;
++                        LoadBoundary(stateFp32, stateOffset, elems);
++                    } else {
++                        AscendC::Duplicate(stateFp32, 0.0f, elems);
++                    }
+                     AscendC::PipeBarrier<PIPE_V>();
+                     CopyOutStateRows(stateIdx, stateFp32, StateWorkspaceFloatOffset(workspaceBase, rowOffset), elems);
+                     curStatePingPong_ ^= 1U;
+@@ -486,7 +503,7 @@ public:
+                                 stateBuf_[curStatePingPong_], StateWorkspaceFloatOffset(workspaceBase, rowOffset), elems);
+                             AscendC::LocalTensor<float> stateFp32 = stateBuf_[stateIdx];
+                             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(stateMte2ToVEvent_[stateIdx]);
+-                            CopyOutFp32Rows(dh0Gm_, stateFp32, dh0Base + rowOffset * V_, elems);
++                            StoreBoundary(stateFp32, dh0Base + rowOffset * V_, elems);
+                             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(stateVToMte2Event_[stateIdx]);
+                             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(stateMte3ToMte2Event_[stateIdx]);
+                         }
+@@ -503,6 +520,50 @@ public:
+     }
+ 
+ private:
++    // Boundary transfers reuse existing events and FP32 scratch; no extra UB.
++    // These synchronous transfers finish before the state scratch is recycled.
++    __aicore__ inline void LoadBoundary(AscendC::LocalTensor<float> dst, int64_t offset, uint32_t elems)
++    {
++        if (boundaryFp32_) {
++            AscendC::DataCopy(dst, dhtFp32Gm_[offset], elems);
++            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(stateMte2ToVEvent_[0]);
++            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(stateMte2ToVEvent_[0]);
++        } else {
++            const uint32_t idx = CopyInRows(dhtGm_, qInputBuf_[curQInputPingPong_], offset, elems);
++            CastInputRows(dst, qInputBuf_[idx], elems, idx);
++        }
++    }
++
++    __aicore__ inline void StoreBoundary(AscendC::LocalTensor<float> src, int64_t offset, uint32_t elems)
++    {
++        if (boundaryFp32_) {
++            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(stateVToMte3Event_[0]);
++            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(stateVToMte3Event_[0]);
++            AscendC::DataCopy(dh0Fp32Gm_[offset], src, elems);
++            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(boundaryCopyDone_);
++            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(boundaryCopyDone_);
++        } else {
++            CopyOutFp32Rows(dh0Gm_, src, offset, elems);
++        }
++    }
++
++    __aicore__ inline void CopyEmptySequenceGradient(int64_t seqIdx, int64_t hvBase, int64_t headCnt)
++    {
++        for (int64_t headOffset = 0; headOffset < headCnt; ++headOffset) {
++            if (headOffset % subBlockNum_ != subBlockIdx_) {
++                continue;
++            }
++            for (int64_t rowOffset = 0; rowOffset < K_; rowOffset += vecRow_) {
++                const uint32_t elems = static_cast<uint32_t>(Min(vecRow_, K_ - rowOffset) * V_);
++                const int64_t offset = ((seqIdx * HV_ + hvBase + headOffset) * K_ + rowOffset) * V_;
++                auto stateFp32 = qFp32Buf_.template Get<float>();
++                LoadBoundary(stateFp32, offset, elems);
++                AscendC::PipeBarrier<PIPE_V>();
++                StoreBoundary(stateFp32, offset, elems);
++            }
++        }
++    }
++
+     static constexpr uint32_t BUFFER_COUNT = 2;
+     static constexpr int64_t VECTOR_REPEAT_FLOAT_ELEMS = 64;
+     static constexpr int64_t BRCB_GROUP_ROWS = 8;
+@@ -511,6 +572,7 @@ private:
+ 
+     __aicore__ inline void InitVectorEvents()
+     {
++        boundaryCopyDone_ = pipe_->AllocEventID<AscendC::HardEvent::MTE3_MTE2>();
+         for (uint32_t eventIdx = 0; eventIdx < BUFFER_COUNT; ++eventIdx) {
+             qMte2ToVEvent_[eventIdx] = pipe_->AllocEventID<AscendC::HardEvent::MTE2_V>();
+             qVToMte2Event_[eventIdx] = pipe_->AllocEventID<AscendC::HardEvent::V_MTE2>();
+@@ -532,6 +594,7 @@ private:
+ 
+     __aicore__ inline void ReleaseVectorEvents()
+     {
++        pipe_->ReleaseEventID<AscendC::HardEvent::MTE3_MTE2>(boundaryCopyDone_);
+         for (uint32_t eventIdx = 0; eventIdx < BUFFER_COUNT; ++eventIdx) {
+             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(qVToMte2Event_[eventIdx]);
+             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(gateVToMte2Event_[eventIdx]);
+@@ -738,6 +801,11 @@ private:
+     AscendC::GlobalTensor<DT> dvGm_;
+     AscendC::GlobalTensor<DT> dhGm_;
+     AscendC::GlobalTensor<DT> dh0Gm_;
++    AscendC::GlobalTensor<DT> dhtGm_;
++    AscendC::GlobalTensor<float> dhtFp32Gm_;
++    AscendC::GlobalTensor<float> dh0Fp32Gm_;
++    bool boundaryFp32_ = false;
++    AscendC::TEventID boundaryCopyDone_;
+     AscendC::GlobalTensor<DT> dv2Gm_;
+     AscendC::GlobalTensor<DT> workspaceGm_;
+     AscendC::GlobalTensor<float> workspaceStateGm_;
+@@ -804,6 +872,7 @@ private:
+     int64_t isVariable_ = 0;
+     float scale_ = 1.0f;
+     bool hasDh0_ = false;
++    bool hasDht_ = false;
+     bool stateVFirst_ = false;
+     int64_t dh0ClearCoreNum_ = 0;
+     int64_t dh0ClearElemsPerCore_ = 0;
+diff --git a/torch_custom/fla_npu/csrc/src/stable_chunk_gated_delta_rule_bwd_dhu.cpp b/torch_custom/fla_npu/csrc/src/stable_chunk_gated_delta_rule_bwd_dhu.cpp
+index 13421f99..f8e0d448 100644
+--- a/torch_custom/fla_npu/csrc/src/stable_chunk_gated_delta_rule_bwd_dhu.cpp
++++ b/torch_custom/fla_npu/csrc/src/stable_chunk_gated_delta_rule_bwd_dhu.cpp
+@@ -80,7 +80,7 @@ run_npu_chunk_gated_delta_rule_bwd_dhu(
+         {sequences, SIZE_OF(dv_meta, 1),
+          transpose_state_layout ? SIZE_OF(dv_meta, 3) : SIZE_OF(q_meta, 3),
+          transpose_state_layout ? SIZE_OF(q_meta, 3) : SIZE_OF(dv_meta, 3)},
+-        q_meta.scalar_type, q_meta);
++        meta_of(*h0).scalar_type, q_meta);
+   }
+   Tensor out_dv = allocate_like(dv_meta);
+ 
+diff --git a/torch_custom/fla_npu/fla_npu/ops/ascendc/_aclnn_ctypes.py b/torch_custom/fla_npu/fla_npu/ops/ascendc/_aclnn_ctypes.py
+index 530f29a2..634e066d 100644
+--- a/torch_custom/fla_npu/fla_npu/ops/ascendc/_aclnn_ctypes.py
++++ b/torch_custom/fla_npu/fla_npu/ops/ascendc/_aclnn_ctypes.py
+@@ -716,7 +716,7 @@ def npu_chunk_gated_delta_rule_bwd_dhu(
+     state_tail = (V, K) if state_v_first else (K, V)
+     dh = _empty((B, NT, Hv, K, V), q)
+     dh0_shape = (N, Hv, *state_tail)
+-    dh0 = _empty(dh0_shape, q) if h0 is not None else None
++    dh0 = _empty(dh0_shape, h0) if h0 is not None else None
+     dv2 = _empty_like(dv)
+     outputs = (dh, dh0, dv2)
+ 

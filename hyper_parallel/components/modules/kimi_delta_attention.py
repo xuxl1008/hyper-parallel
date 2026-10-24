@@ -36,14 +36,19 @@ __all__ = [
     "torch_recurrent_kda",
 ]
 
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from hyper_parallel.components.functional.kimi_delta_attention_ascendc import ascendc_chunk_kda
+from hyper_parallel.components.functional.linear_attention_packed import (
+    packed_causal_conv1d, packed_reference, resolve_packed_sequence,
+)
 
-_KDA_BACKENDS = frozenset({"eager", "triton"})
+_KDA_BACKENDS = frozenset({"eager", "triton", "ascendc"})
 _TRITON_KDA_HEAD_DIM = 128
 _TRITON_KDA_CHUNK_SIZE = 64
 
@@ -56,6 +61,7 @@ def _has_triton_kda_shapes(
     a_log: torch.Tensor,
     dt_bias: torch.Tensor,
     chunk_size: int,
+    packed: bool = False,
 ) -> bool:
     """Check the fixed dense shapes accepted by the Triton KDA path."""
     batch_size, sequence_length, num_query_heads, key_dim = query.shape
@@ -69,7 +75,7 @@ def _has_triton_kda_shapes(
         dt_bias.numel() == num_value_heads * key_dim,
         key_dim == value_dim == _TRITON_KDA_HEAD_DIM,
         chunk_size == _TRITON_KDA_CHUNK_SIZE,
-        sequence_length % chunk_size == 0,
+        packed or sequence_length % chunk_size == 0,
     ))
 
 
@@ -84,6 +90,7 @@ def _is_triton_kda_input_supported(
     *,
     chunk_size: int,
     lower_bound: Optional[float],
+    packed: bool = False,
 ) -> bool:
     """Check the fixed Kimi K3 contract validated by the fused backend."""
     operands = (key, value, gate, beta, a_log, dt_bias)
@@ -104,7 +111,8 @@ def _is_triton_kda_input_supported(
         return False
 
     shape_supported = _has_triton_kda_shapes(
-        query, value, gate, beta, a_log, dt_bias, chunk_size
+        query, value, gate, beta, a_log, dt_bias, chunk_size,
+        packed=packed,
     )
     lower_bound_supported = -5.0 <= lower_bound < 0
     if not (shape_supported and lower_bound_supported):
@@ -123,6 +131,7 @@ def is_triton_kda_available(
     *,
     chunk_size: int = _TRITON_KDA_CHUNK_SIZE,
     lower_bound: Optional[float] = -5.0,
+    packed: bool = False,
 ) -> bool:
     """Return whether the validated Triton-Ascend KDA backend is available."""
     if chunk_size != _TRITON_KDA_CHUNK_SIZE:
@@ -137,6 +146,7 @@ def is_triton_kda_available(
         dt_bias,
         chunk_size=chunk_size,
         lower_bound=lower_bound,
+        packed=packed,
     ):
         return False
     from hyper_parallel.components.functional.kimi_delta_attention_fla_adapter import (  # pylint: disable=import-outside-toplevel
@@ -394,6 +404,7 @@ def torch_chunk_kda(
     use_beta_sigmoid_in_kernel: bool = False,
     lower_bound: Optional[float] = None,
     chunk_size: int = 64,
+    cu_seqlens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Evaluate chunkwise KDA using the UT/WY representation.
 
@@ -401,6 +412,14 @@ def torch_chunk_kda(
     :func:`torch_recurrent_kda`; comparing the two catches errors in the
     chunk transform that a second token loop would hide.
     """
+    if cu_seqlens is not None:
+        return packed_reference(
+            torch_chunk_kda, (query, key, value, gate, beta), cu_seqlens,
+            initial_state=initial_state, output_final_state=output_final_state,
+            a_log=a_log, dt_bias=dt_bias, scale=scale,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, use_gate_in_kernel=use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel, lower_bound=lower_bound, chunk_size=chunk_size,
+        )
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
     output_dtype = value.dtype
@@ -525,8 +544,17 @@ def chunk_kda(
     lower_bound: Optional[float] = None,
     chunk_size: int = 64,
     backend: str = "eager",
+    cu_seqlens: Optional[torch.Tensor | Sequence[int]] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Dispatch KDA to an explicitly selected eager or Triton backend."""
+    """Dispatch dense or packed KDA to the explicitly selected local backend."""
+    if query.ndim == 3:
+        output, final = chunk_kda(
+            *(tensor.unsqueeze(0) for tensor in (query, key, value, gate, beta)),
+            a_log=a_log, dt_bias=dt_bias, scale=scale, initial_state=initial_state,
+            output_final_state=output_final_state, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel, use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            lower_bound=lower_bound, chunk_size=chunk_size, backend=backend, cu_seqlens=cu_seqlens)
+        return output.squeeze(0), final
     backend = backend.lower()
     if backend not in _KDA_BACKENDS:
         raise ValueError(
@@ -550,10 +578,11 @@ def chunk_kda(
             use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
             lower_bound=lower_bound,
             chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
         )
     if initial_state is not None or output_final_state:
         raise NotImplementedError(
-            "KDA backend='triton' currently supports zero initial state without "
+            f"KDA backend={backend!r} currently supports zero initial state without "
             "returning a final state; stateful execution is owned by the CP backend."
         )
     if not (
@@ -562,9 +591,17 @@ def chunk_kda(
         and use_beta_sigmoid_in_kernel
     ):
         raise NotImplementedError(
-            "KDA backend='triton' requires fused Q/K normalization, gate activation, "
+            f"KDA backend={backend!r} requires fused Q/K normalization, gate activation, "
             "and beta sigmoid."
         )
+    if backend == "ascendc":
+        output = ascendc_chunk_kda(
+            query, key, value, gate, beta,
+            a_log=a_log.float() if a_log is not None else None,
+            dt_bias=dt_bias.float() if dt_bias is not None else None,
+            scale=scale, lower_bound=lower_bound, chunk_size=chunk_size, cu_seqlens=cu_seqlens,
+        )
+        return output, None
     triton_a_log = a_log.float() if a_log is not None else None
     triton_dt_bias = dt_bias.float() if dt_bias is not None else None
     if not _is_triton_kda_input_supported(
@@ -577,6 +614,7 @@ def chunk_kda(
         triton_dt_bias,
         chunk_size=chunk_size,
         lower_bound=lower_bound,
+        packed=cu_seqlens is not None,
     ):
         raise RuntimeError(
             "KDA backend='triton' received an unsupported input contract; it requires "
@@ -600,6 +638,7 @@ def chunk_kda(
         lower_bound=lower_bound,
         chunk_size=chunk_size,
         safe_gate=True,
+        cu_seqlens=cu_seqlens,
     )
     return output, None
 
@@ -880,8 +919,11 @@ class KimiDeltaAttention(nn.Module):
     def _run_short_convolution(
         projected: torch.Tensor,
         convolution: nn.Conv1d,
+        sequence_info=None,
     ) -> torch.Tensor:
         """Apply one causal depthwise convolution and trim its right padding."""
+        if sequence_info is not None:
+            return packed_causal_conv1d(projected, convolution, sequence_info)
         sequence_length = projected.shape[1]
         output = convolution(projected.transpose(1, 2))[:, :, :sequence_length]
         return F.silu(output.transpose(1, 2))
@@ -901,25 +943,29 @@ class KimiDeltaAttention(nn.Module):
         output_attentions: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Run fixed-length, training-time KDA without recurrent cache."""
+        """Run dense or packed training-time KDA without recurrent cache."""
         if use_cache or kwargs.get("cache_params") is not None:
             raise NotImplementedError("KimiDeltaAttention does not support inference cache.")
         if output_attentions:
             raise NotImplementedError("KDA does not materialize attention weights.")
-        if kwargs.get("cu_seqlens") is not None:
-            raise NotImplementedError("Packed variable-length KDA is not implemented.")
         if attention_mask is not None and not bool(attention_mask.bool().all().item()):
             raise NotImplementedError("Padded KDA batches are not implemented.")
 
+        is_tnd = hidden_states.ndim == 2
+        if is_tnd:
+            hidden_states = hidden_states.unsqueeze(0)
         batch_size, sequence_length, _ = hidden_states.shape
+        sequence_info = resolve_packed_sequence(kwargs, sequence_length)
+        if sequence_info is not None and batch_size != 1:
+            raise ValueError("Packed KDA requires a flattened batch dimension of one.")
         query = self._run_short_convolution(
-            self.q_proj(hidden_states), self.q_conv1d
+            self.q_proj(hidden_states), self.q_conv1d, sequence_info
         ).reshape(batch_size, sequence_length, self.num_heads, self.head_k_dim)
         key = self._run_short_convolution(
-            self.k_proj(hidden_states), self.k_conv1d
+            self.k_proj(hidden_states), self.k_conv1d, sequence_info
         ).reshape(batch_size, sequence_length, self.num_heads, self.head_k_dim)
         value = self._run_short_convolution(
-            self.v_proj(hidden_states), self.v_conv1d
+            self.v_proj(hidden_states), self.v_conv1d, sequence_info
         ).reshape(batch_size, sequence_length, self.num_v_heads, self.head_v_dim)
         gate = self.f_b_proj(self.f_a_proj(hidden_states)).reshape(
             batch_size, sequence_length, self.num_v_heads, self.head_k_dim
@@ -942,9 +988,11 @@ class KimiDeltaAttention(nn.Module):
             use_beta_sigmoid_in_kernel=True,
             lower_bound=self.gate_lower_bound,
             chunk_size=self.chunk_size,
+            cu_seqlens=None if sequence_info is None else sequence_info.local_offsets,
         )
         output_gate = self._output_gate(hidden_states).reshape(
             batch_size, sequence_length, self.num_v_heads, self.head_v_dim
         )
         output = self.o_norm(output, output_gate)
-        return self.o_proj(output.reshape(batch_size, sequence_length, self.value_dim))
+        output = self.o_proj(output.reshape(batch_size, sequence_length, self.value_dim))
+        return output.squeeze(0) if is_tnd else output

@@ -202,10 +202,9 @@ def lightning_indexer(
         return _bsnd_lightning_indexer(query, key, weights, ratio, topk, segments[0])
     if query.shape[0] != 1:
         raise ValueError("Packed Lightning Indexer requires batch size one")
-    result = torch.full((*query.shape[:2], topk), -1, device=query.device, dtype=torch.int32)
     plan = csa_tnd_plan(segments, ratio)
     if plan is None:
-        return result
+        return torch.full((*query.shape[:2], topk), -1, device=query.device, dtype=torch.int32)
     options, metadata = _tnd_indexer_metadata(plan, query.device, query.shape[2], query.shape[3], topk, ratio)
     with torch.autocast(device_type=query.device.type, enabled=False):
         indices, _ = _load_indexer_op()(
@@ -216,5 +215,8 @@ def lightning_indexer(
     indices = torch.where(indices[:, 0] >= 0, indices[:, 0] + offsets, key.shape[1])
     indices = sort_key_indices(indices, key.shape[1])
     indices = indices.masked_fill(indices == key.shape[1], -1)
+    if plan.covers_queries(query.shape[1]):
+        return indices.unsqueeze(0)
+    result = torch.full((*query.shape[:2], topk), -1, device=query.device, dtype=torch.int32)
     plan.restore(indices, result)
     return result

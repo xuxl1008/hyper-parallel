@@ -113,7 +113,7 @@ def kimi_delta_attention_ulysses_cp_wrapper(
         tp_mesh: Tensor-parallel mesh; simultaneous TP/CP is unsupported.
         cp_mesh: Chronologically ordered context-parallel mesh.
         ep_mesh: Expert-parallel context, unused by KDA.
-        backend: Local KDA implementation: eager or triton.
+        backend: Local KDA implementation: eager, triton or experimental ascendc.
         chunk_size: Tokens per local recurrence chunk.
     """
     del mesh, ep_mesh

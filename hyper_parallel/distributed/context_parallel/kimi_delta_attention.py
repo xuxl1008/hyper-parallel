@@ -47,7 +47,7 @@ from hyper_parallel.distributed.context_parallel.kimi_delta_attention_state impo
 )
 
 
-_KDA_BACKENDS = frozenset({"eager", "triton"})
+_KDA_BACKENDS = frozenset({"eager", "triton", "ascendc"})
 
 
 def _run_local_kda(
@@ -66,7 +66,7 @@ def _run_local_kda(
     backend: str,
 ) -> torch.Tensor:
     """Run the explicitly selected local KDA implementation."""
-    if backend == "triton" and not safe_gate:
+    if backend in {"triton", "ascendc"} and not safe_gate:
         raise RuntimeError("The fused KDA backend requires the lower-bounded gate.")
     output, _ = chunk_kda(
         query,
@@ -753,6 +753,11 @@ class _KDAStateCP(nn.Module):
         self.cp_size = self.cp_mesh.size()
         self.cp_rank = self.cp_mesh.get_local_rank()
         self.cp_group = self.cp_mesh.get_group()
+        if backend == "ascendc" and self.cp_size > 1:
+            raise NotImplementedError(
+                "AscendC state CP requires a validated nonzero dHT backward; "
+                "use the Ulysses executor for the first AscendC training milestone."
+            )
         if backend != "triton" and state_cp_method != "p2p":
             raise ValueError("KDA AllGather state exchange requires backend='triton'.")
         self.state_cp = build_kda_state_cp(self.cp_mesh, state_cp_method, allgather_group_size)

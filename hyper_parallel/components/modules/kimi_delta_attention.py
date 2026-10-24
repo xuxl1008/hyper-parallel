@@ -36,18 +36,19 @@ __all__ = [
     "torch_recurrent_kda",
 ]
 
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from hyper_parallel.components.functional.kimi_delta_attention_ascendc import ascendc_chunk_kda
 from hyper_parallel.components.functional.linear_attention_packed import (
     packed_causal_conv1d, packed_reference, resolve_packed_sequence,
 )
 
-
-_KDA_BACKENDS = frozenset({"eager", "triton"})
+_KDA_BACKENDS = frozenset({"eager", "triton", "ascendc"})
 _TRITON_KDA_HEAD_DIM = 128
 _TRITON_KDA_CHUNK_SIZE = 64
 
@@ -543,9 +544,9 @@ def chunk_kda(
     lower_bound: Optional[float] = None,
     chunk_size: int = 64,
     backend: str = "eager",
-    cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens: Optional[torch.Tensor | Sequence[int]] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Dispatch KDA to an explicitly selected eager or Triton backend."""
+    """Dispatch dense or packed KDA to the explicitly selected local backend."""
     if query.ndim == 3:
         output, final = chunk_kda(
             *(tensor.unsqueeze(0) for tensor in (query, key, value, gate, beta)),
@@ -581,7 +582,7 @@ def chunk_kda(
         )
     if initial_state is not None or output_final_state:
         raise NotImplementedError(
-            "KDA backend='triton' currently supports zero initial state without "
+            f"KDA backend={backend!r} currently supports zero initial state without "
             "returning a final state; stateful execution is owned by the CP backend."
         )
     if not (
@@ -590,9 +591,17 @@ def chunk_kda(
         and use_beta_sigmoid_in_kernel
     ):
         raise NotImplementedError(
-            "KDA backend='triton' requires fused Q/K normalization, gate activation, "
+            f"KDA backend={backend!r} requires fused Q/K normalization, gate activation, "
             "and beta sigmoid."
         )
+    if backend == "ascendc":
+        output = ascendc_chunk_kda(
+            query, key, value, gate, beta,
+            a_log=a_log.float() if a_log is not None else None,
+            dt_bias=dt_bias.float() if dt_bias is not None else None,
+            scale=scale, lower_bound=lower_bound, chunk_size=chunk_size, cu_seqlens=cu_seqlens,
+        )
+        return output, None
     triton_a_log = a_log.float() if a_log is not None else None
     triton_dt_bias = dt_bias.float() if dt_bias is not None else None
     if not _is_triton_kda_input_supported(

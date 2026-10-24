@@ -1,0 +1,153 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Optional fla-npu Ascend C local KDA backend for dense Ulysses training."""
+# pylint: disable=forbidden-backend-import
+
+from __future__ import annotations
+
+import importlib
+import math
+from typing import Any
+
+import torch
+from torch.autograd.function import once_differentiable
+
+
+def _load_ops():
+    """Keep the optional native runtime out of ordinary framework imports."""
+    try:
+        ops = importlib.import_module("fla_npu.ops.ascendc")
+    except ImportError as error:
+        raise RuntimeError("backend='ascendc' requires a compatible fla-npu installation.") from error
+    required = ("chunk_kda_fwd_prepare", "chunk_fwd_h", "chunk_kda_fwd_finalize", "chunk_kda_bwd")
+    if any(not callable(getattr(ops, name, None)) for name in required):
+        raise RuntimeError("fla-npu lacks the public KDA prepare/state/finalize/backward APIs.")
+    return ops
+
+
+def _forward_kda(inputs, scale, lower_bound):
+    """Run native stages, returning only the intermediates needed by autograd."""
+    ops = _load_ops()
+    query, key, value, gate, beta, a_log, dt_bias = inputs
+    prepared = list(ops.chunk_kda_fwd_prepare(
+        query, key, value, gate, beta, scale, layout="BNSD", chunk_size=64,
+        safe_gate=True, lower_bound=lower_bound, use_gate_in_kernel=True,
+        A_log=a_log, dt_bias=dt_bias.flatten(), epsilon=1e-6,
+        use_qk_l2norm_in_kernel=True, use_beta_sigmoid_in_kernel=True,
+        use_exp2=True, backward_mode="save",
+    ))
+    gk, aqk, _, weights, residual, _, kg, qg_scaled, *_ = prepared
+    hidden, v_new, _ = ops.chunk_fwd_h(
+        kg, weights, residual, gk=gk, output_final_state=False, use_exp2=True,
+    )
+    output = ops.chunk_kda_fwd_finalize(qg_scaled, aqk, v_new, hidden, output_layout="BSND")
+    # These buffers have no backward consumer and must not live across layers.
+    prepared[4] = prepared[7] = None
+    return output, prepared, hidden, v_new
+
+
+def _norm_backward(grad, normalized, rstd):
+    """A2 needs this FP32 epilogue; it does not require a Triton dependency."""
+    grad, normalized = grad.float(), normalized.float()
+    projection = (grad * normalized).sum(-1, keepdim=True)
+    return (grad - normalized * projection) * rstd.unsqueeze(-1)
+
+
+class _AscendCKDA(torch.autograd.Function):
+    """Own all native activations per invocation, including checkpoint replay."""
+
+    @staticmethod
+    def forward(ctx: Any, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                gate: torch.Tensor, beta: torch.Tensor, a_log: torch.Tensor,
+                dt_bias: torch.Tensor, scale: float, lower_bound: float) -> torch.Tensor:
+        """Save native intermediates without retaining forward-only workspaces."""
+        inputs = (query, key, value, gate, beta, a_log, dt_bias)
+        output, prepared, hidden, v_new = _forward_kda(inputs, scale, lower_bound)
+        # Raw Q/K and beta logits are unnecessary once their auxiliaries exist.
+        ctx.save_for_backward(value, gate, a_log, dt_bias, *prepared, hidden, v_new)
+        ctx.dtypes = tuple(tensor.dtype for tensor in inputs)
+        ctx.scale, ctx.lower_bound = scale, lower_bound
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple:
+        """Apply native local backward and the explicit raw-input chain rule."""
+        value, gate, a_log, dt_bias, *saved = ctx.saved_tensors
+        (gk, aqk, akk, weights, _, qg, kg, _, query, key,
+         query_rstd, key_rstd, beta, hidden, v_new) = saved
+        dq, dk, dv, dbeta, dgate, _, da_log, ddt_bias = _load_ops().chunk_kda_bwd(
+            query, key, value, beta, gk, aqk, akk, weights, qg, kg, v_new, hidden,
+            grad_output.transpose(1, 2).contiguous(), ctx.scale,
+            raw_g=gate, A_log=a_log, dt_bias=dt_bias,
+            initial_state=None, dht=None, chunk_size=64,
+            safe_gate=True, lower_bound=ctx.lower_bound, use_gate_in_kernel=True,
+            disable_recompute=True, use_exp2=True, state_v_first=False,
+            implementation="legacy",
+        )
+        dq = _norm_backward(dq, query, query_rstd).to(ctx.dtypes[0])
+        dk = _norm_backward(dk, key, key_rstd).to(ctx.dtypes[1])
+        dbeta = dbeta.float() * beta * (1.0 - beta)
+        gradients = (dq, dk, dv, dgate, dbeta, da_log, ddt_bias.reshape_as(dt_bias))
+        return (*(grad.to(dtype) for grad, dtype in zip(gradients, ctx.dtypes)), None, None)
+
+
+def ascendc_chunk_kda(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+    gate: torch.Tensor, beta: torch.Tensor, *, a_log: torch.Tensor,
+    dt_bias: torch.Tensor, scale: float | None = None, lower_bound: float = -5.0,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """Run raw-input dense KDA using native attention stages and Torch-NPU epilogues.
+
+    Args:
+        query: Raw BF16 queries [B,T,H,128].
+        key: Raw BF16 keys with the same shape.
+        value: BF16 values with the same shape.
+        gate: BF16 or FP32 gate logits with the same shape.
+        beta: BF16 or FP32 beta logits [B,T,H].
+        a_log: FP32 decay parameters with H elements.
+        dt_bias: FP32 gate bias with H*128 elements.
+        scale: Positive attention scale, default 1/sqrt(128).
+        lower_bound: Safe gate lower bound in [-5,0).
+        chunk_size: Must be 64 for this native kernel family.
+
+    Returns:
+        BF16 output [B,T,H,128]. External recurrent states, packed sequences,
+        and double backward are not exposed by this initial integration.
+    """
+    if query.ndim != 4 or query.shape[-1] != 128 or min(query.shape) <= 0:
+        raise ValueError("Ascend C KDA requires nonempty dense [B,T,H,128] inputs.")
+    if query.shape[1] % 64 or query.shape[2] > 128 or chunk_size != 64:
+        raise ValueError("Ascend C KDA requires T divisible by 64, H<=128 and chunk_size=64.")
+    if any(tensor.shape != query.shape or tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
+        raise ValueError("Ascend C KDA requires equal BF16 Q/K/V shapes.")
+    if (gate.shape != query.shape or beta.shape != query.shape[:-1]
+            or any(tensor.dtype not in (torch.bfloat16, torch.float32) for tensor in (gate, beta))):
+        raise ValueError("Ascend C KDA requires matching BF16/FP32 gate and beta logits.")
+    if (a_log is None or dt_bias is None or a_log.dtype != torch.float32 or dt_bias.dtype != torch.float32
+            or a_log.numel() != query.shape[2] or dt_bias.numel() != query.shape[2] * 128):
+        raise ValueError("Ascend C KDA requires FP32 a_log[H] and dt_bias[H,128].")
+    tensors = (query, key, value, gate, beta, a_log, dt_bias)
+    if query.device.type != "npu" or any(tensor.device != query.device for tensor in tensors):
+        raise ValueError("Ascend C KDA requires all tensors on the same NPU.")
+    scale = 128 ** -0.5 if scale is None else float(scale)
+    if not math.isfinite(scale) or scale <= 0 or lower_bound is None or not -5 <= lower_bound < 0:
+        raise ValueError("Ascend C KDA requires a positive finite scale and lower_bound in [-5,0).")
+    tokens = tuple(tensor.transpose(1, 2).contiguous() for tensor in tensors[:5])
+    # A head slice may be contiguous while retaining the full-head NPU storage
+    # descriptor. Native tiling needs a descriptor for precisely this shard.
+    return _AscendCKDA.apply(*tokens, a_log.reshape(-1).clone(),
+                            dt_bias.reshape(-1, 128).clone(), scale, lower_bound)

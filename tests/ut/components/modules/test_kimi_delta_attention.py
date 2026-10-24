@@ -369,3 +369,25 @@ def test_kda_state_summary_keeps_fp32_state_under_autocast():
     assert state_ext.dtype == torch.float32
     assert transition.dtype == torch.float32
     assert final_state.dtype == torch.float32
+
+
+@pytest.mark.parametrize('state_options', [
+    {'initial_state': torch.zeros(1, 2, 4, 3)}, {'output_final_state': True},
+])
+def test_ascendc_rejects_stateful_contract_before_native_import(state_options):
+    """Unsupported state requests must not silently enter a different backend."""
+    inputs = _make_inputs(sequence_length=8)
+    operands = tuple(inputs[name] for name in ('query', 'key', 'value', 'gate', 'beta'))
+    with pytest.raises(NotImplementedError, match='zero initial state'):
+        chunk_kda(*operands, backend='ascendc', **state_options)
+
+
+def test_ascendc_rejects_cpu_without_fallback():
+    """Selecting a native NPU backend must not execute the eager CPU reference."""
+    shape = (1, 64, 2, 128)
+    query = torch.zeros(shape, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match='same NPU'):
+        chunk_kda(query, query, query, query, query[..., 0],
+                  a_log=torch.zeros(2), dt_bias=torch.zeros(2, 128),
+                  use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+                  use_beta_sigmoid_in_kernel=True, lower_bound=-5, backend='ascendc')

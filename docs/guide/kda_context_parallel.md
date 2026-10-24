@@ -54,11 +54,11 @@ plan_overrides:
 CP 总大小由训练的并行配置决定。`state_cp_method` 只选择状态 CP 方式，完整方案还需结合
 `ulysses_degree` 和 `allgather_group_size` 判断；例如 `state_cp_method: p2p` 配合 `ulysses_degree: 2`
 表示 Ulysses + P2P。统一入口内部固定使用 64-token chunk，不暴露 `chunk_size` 配置；
-`eager` 和 `triton` 均采用这一大小。
+各后端均采用这一大小。
 
 | 参数 | 默认值 | 含义与约束 |
 |------|--------|------------|
-| `backend` | `triton` | 本地 KDA 后端。AG 和分组 AG 需要 `triton`；已有 P2P/Ulysses 支持 `eager`。 |
+| `backend` | `triton` | 本地 KDA 后端。AG 和分组 AG 需要 `triton`；P2P/Ulysses 支持 `eager`；纯 Ulysses 另支持 `ascendc`。 |
 | `state_cp_method` | `p2p` | 状态 CP 方式，可选 `p2p`、`allgather`、`grouped_allgather_p2p`。 |
 | `ulysses_degree` | `1` | U；正整数，必须整除 CP 大小，且 query/key head 数和 value head 数都必须能被 U 整除。 |
 | `allgather_group_size` | `1` | g；每个组内 AllGather 包含的状态 rank 数，必须整除 R。仅用于 `grouped_allgather_p2p`；纯 `allgather` 自动收集整个 R 组，此项保持1。 |
@@ -124,3 +124,32 @@ S/G 配对参照的是 Ascend 本地 h/dhu，FLA 通用 CP 摘要的舍入组织
 
 纯 P2P 且初态为零时，第一个状态 rank 不生成或保存没有后续读者的 M；AG 和分组 AG 仍为每个 rank
 保存本地 M。状态缓存按调用独立持有，以支持多个在途 forward、逆序 backward 与 checkpoint 重算。
+
+## Ascend C Ulysses 后端
+
+安装与硬件、CANN 匹配的 `flash-linear-attention-npu` 后，可显式选择 `backend: ascendc`。
+后端复用 fla-npu 的公开 Prepare、FwdH、Finalize 与完整 Backward 接口；不会隐式切回 Triton。
+Prepare 内融合 Q/K L2Norm、beta sigmoid、gate 与块内准备。A2 上的 Q/K norm 和 sigmoid 反向
+使用 Torch-NPU FP32 点运算；模型投影、ShortConv、输出归一化和输出投影仍由现有模型层执行。
+
+纯 Ulysses 可使用已有专用 wrapper，它自动使用整个 CP mesh：
+
+```yaml
+inner_wrapper:
+  _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_ulysses_cp_wrapper
+  backend: ascendc
+```
+
+也可在统一 wrapper 中设置 `ulysses_degree` 等于 CP 大小，保持 `state_cp_method: p2p` 和
+`allgather_group_size: 1`；此时状态轴大小为1，不执行状态 P2P。其余输入切分、head 整除、参数梯度
+归约要求与现有 Ulysses 相同。后端不改变模型参数名或额外执行参数 AllReduce。
+
+初版支持 dense BSND、相等的 Q/K/V head 数、BF16 Q/K/V、BF16/FP32 gate/beta logits、FP32 gate
+参数、K=V=128、64-token chunk 和完整 chunk 长度，每卡本地 core 的 head 数不超过128。
+原生前向保存的辅助张量按每次调用独占，前向专用的 u/qg_scaled 不跨前反向保留。
+双重反向、非零初态/终态梯度、带状态轴的混合方案及 packed/TND 模型入口尚未开放，遇到未支持
+配置会报错。纯 Ulysses 不需要非零 dHT 补丁，也不需要自研 S/M/G 摘要。
+
+当前配对版本为 fla-npu `8762b6139de96e62205cefb1595aa41e38497e82` 的 A2 构建，至少包含
+`chunk_kda_fwd` 和 `chunk_kda_bwd` 及其依赖阶段。接口存在不等于任意发行版都已完成数值验证；
+A5 优化反向和卡内 coarse CP 不属于本初版的验收范围。

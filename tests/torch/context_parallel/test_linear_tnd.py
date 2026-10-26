@@ -33,3 +33,11 @@ def test_linear_tnd_npu(workers, monkeypatch):
     """Feature: TND CP. Description: Kernels, protocols and replay. Expectation: Finite, isolated, identical replay."""
     monkeypatch.setenv("HCCL_DETERMINISTIC", "true")
     torchrun_case(str(Path(__file__).with_name("_test_linear_tnd.py")), "test_linear_tnd_npu", num_proc=workers)
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@pytest.mark.parametrize("workers", [3, 4])
+def test_linear_tnd_rd_state_cpu(workers):
+    """Feature: TND RD. Description: Independent affine/reset reference. Expectation: Correct live caches."""
+    torchrun_case(str(Path(__file__).with_name("_test_kda_rd_boundary.py")),
+                  "test_kda_rd_boundary_cpu", num_proc=workers)

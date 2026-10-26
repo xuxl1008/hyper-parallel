@@ -124,3 +124,16 @@ S/G 配对参照的是 Ascend 本地 h/dhu，FLA 通用 CP 摘要的舍入组织
 
 纯 P2P 且初态为零时，第一个状态 rank 不生成或保存没有后续读者的 M；AG 和分组 AG 仍为每个 rank
 保存本地 M。状态缓存按调用独立持有，以支持多个在途 forward、逆序 backward 与 checkpoint 重算。
+
+
+## Recursive Doubling 与 TND
+
+`state_cp_method: recursive_doubling` 使用有序递归倍增传播状态摘要，并按前向缓存的转移计算反向状态梯度。
+可与 `ulysses_degree` 组合，`allgather_group_size` 固定为 1；它不使用组内 AllGather。
+该选项复用相同的 Triton 本地算子，支持 dense 以及本文关联的
+[TND 连续分片](linear_attention_tnd_cp.md)。真实 reset 使用零有效转移，不传播跨文档状态。
+
+通信与缓存按调用隔离，支持反序 backward 和非重入 checkpoint 的验证路径。RD 缓存随轮次增长；
+AG 的“只留一份本地 M”不能用于估算 RD。当前不支持同时 TP、图捕获、空或不等长 rank。
+底层通信默认使用公开 batch P2P；仅在已验证的 Torch/Torch-NPU/CANN/SoC 组合中选用 eager coalescing，
+该选择不改变矩阵运算顺序。协议资格与整层训练资格应分别判断，不以对数轮数承诺任意 CP 规模的性能。

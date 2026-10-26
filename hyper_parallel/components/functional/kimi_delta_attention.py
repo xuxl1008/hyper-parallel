@@ -203,7 +203,7 @@ def fused_chunk_kda(
 
 
 class _KDAStateP2PFunction(torch.autograd.Function):
-    """Run shared local KDA and autograd for P2P or gathered state exchange."""
+    """Run shared local KDA and autograd with the selected state exchange."""
 
     @staticmethod
     def forward(  # pylint: disable=arguments-differ,too-many-arguments,too-many-locals
@@ -247,7 +247,7 @@ class _KDAStateP2PFunction(torch.autograd.Function):
             next_rank: Global rank of the following sequence partition.
             cp_rank: Chronological index within the CP group.
             cp_size: Number of state partitions.
-            state_cp: Optional gather executor; None selects P2P.
+            state_cp: Executor returning an invocation cache; None selects P2P.
         """
         ops = get_fla_kda_staged_ops()
         plan = None if sequence_info is None else sequence_info.materialize(query.device, chunk_size)
@@ -315,8 +315,10 @@ class _KDAStateP2PFunction(torch.autograd.Function):
 
         send_handle = None
         send_state = None
+        state_cache = (transition,) if transition is not None else ()
         if state_cp is not None:
-            initial_state = state_cp.forward(state_ext, transition)
+            initial_state, state_cache = state_cp.forward(state_ext, transition)
+            transition = None
         elif send_next:
             summary_initial = initial_state if transition is not None else None
             final_state = apply_kda_state_summary(state_ext, transition, summary_initial)
@@ -345,8 +347,7 @@ class _KDAStateP2PFunction(torch.autograd.Function):
             plan.cu_seqlens, plan.chunk_indices, plan.chunk_offsets)
         ctx.save_for_backward(
             query, query_rstd, key, key_rstd, value, gate_raw, beta_raw, a_log, dt_bias, attention_qk,
-            attention_kk, transition if transition is not None else query.new_empty(0), saved_initial_state,
-            *packed_tensors,
+            attention_kk, saved_initial_state, *state_cache, *packed_tensors,
         )
         ctx.scale = scale
         ctx.lower_bound = lower_bound
@@ -358,6 +359,7 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
         ctx.state_cp = state_cp
+        ctx.state_cache_count = len(state_cache)
         ctx.receive_previous = receive_previous
         ctx.send_next = send_next
         ctx.sequence_info = sequence_info
@@ -382,8 +384,10 @@ class _KDAStateP2PFunction(torch.autograd.Function):
 
         (
             query, query_rstd, key, key_rstd, value, gate_raw, beta_raw, a_log, dt_bias,
-            attention_qk, attention_kk, transition, saved_initial_state, *packed_tensors,
+            attention_qk, attention_kk, saved_initial_state, *saved_tail,
         ) = ctx.saved_tensors
+        state_cache = tuple(saved_tail[:ctx.state_cache_count])
+        packed_tensors = saved_tail[ctx.state_cache_count:]
         sequence_info = ctx.sequence_info
         cu_seqlens = chunk_indices = chunk_offsets = None
         if sequence_info is not None:
@@ -442,9 +446,10 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         send_handle = None
         send_state_gradient = None
         if ctx.state_cp is not None:
-            grad_final_state = ctx.state_cp.backward(grad_state_ext, transition)
+            grad_final_state = ctx.state_cp.backward(grad_state_ext, state_cache)
         elif ctx.receive_previous:
-            summary_final_gradient = grad_final_state if transition.numel() else None
+            transition = state_cache[0] if state_cache else None
+            summary_final_gradient = grad_final_state if transition is not None else None
             grad_initial_state = apply_kda_state_gradient_summary(grad_state_ext, transition, summary_final_gradient)
             send_state_gradient = grad_initial_state.contiguous()
             send_handle = dist.isend(send_state_gradient, dst=ctx.prev_rank, group=ctx.cp_group)
@@ -525,7 +530,7 @@ def fused_chunk_kda_p2p(
     """Run one sequence-sharded KDA segment with a selected state CP executor.
 
     The historical P2P entry name is retained for existing callers; passing
-    state_cp selects AllGather or grouped AllGather/P2P with the same local ops.
+    state_cp selects gathered or recursive state exchange with the same local ops.
 
     Args:
         query: Query input [B,T,H,K].
@@ -544,7 +549,7 @@ def fused_chunk_kda_p2p(
         lower_bound: Lower bound for the activated gate.
         chunk_size: Tokens per local chunk.
         safe_gate: Enable the staged safe-gate path.
-        state_cp: Optional stateless AG executor; None selects existing P2P.
+        state_cp: State executor returning an invocation cache; None selects existing P2P.
 
     Returns:
         Output tokens in the local sequence layout.

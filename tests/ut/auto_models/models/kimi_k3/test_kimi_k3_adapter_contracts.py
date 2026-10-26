@@ -402,7 +402,7 @@ class TestKDACombinedAdapter(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     protocol.forward(state, state.double())
                 with self.assertRaises(ValueError):
-                    protocol.backward(state, state[..., :64])
+                    protocol.backward(state, (state[..., :64],))
                 for invalid in (state[:0], torch.empty_like(state, device="meta")):
                     with self.assertRaises(ValueError):
                         protocol.forward(invalid, invalid)

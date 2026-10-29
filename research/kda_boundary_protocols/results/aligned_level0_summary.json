@@ -1,0 +1,264 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "source_artifact": "rd_protocol_qualification_20261029/profile_analysis.json",
+    "source_sha256": "13c73fee023683338ceb2f269b7dd9644e601c86245f6426d57d85f2600d8b52"
+  },
+  "explanatory_source": {
+    "source_artifact": "rd_protocol_qualification_20261029/profile_analysis.md",
+    "source_sha256": "ee3ce919f6e5cd6fd135c56bc883616bd5fc54b481288d6750ac95247631df82"
+  },
+  "measurement_date": "2026-10-29",
+  "scope": "Current matched FLA real CP8, H96/K128, local4K, single long document; fixed affine summaries only.",
+  "implementation_scope": "Historical aligned Level0 sample; not the portable torch-native archive.",
+  "association": "CPU stage -> torch_to_npu flow start/end -> exact device pid/tid/timestamp.",
+  "sampling": "One setup forward/backward inside profiler, then barrier and synchronize; one marked forward/backward analyzed, excluding setup.",
+  "limitations": [
+    "One aligned Level0 sample per protocol; use unprofiled medians for performance comparisons.",
+    "CPU markers identify submission origin and are not device stage durations.",
+    "Device category and stage intervals overlap and must not be added to infer total time.",
+    "HCCL aggregate durations include peer waiting and do not measure raw wire bandwidth.",
+    "AICPU BatchSendRecv is dispatch, not full P2P transfer; missing P2P aggregate does not imply zero communication.",
+    "The original JSON retains an initial-entry-skew limitation; the accompanying final analysis and aligned trace identifiers establish that these numeric records are from the aligned resample."
+  ],
+  "rank_array_order": [0, 1, 2, 3, 4, 5, 6, 7],
+  "protocols": {
+    "flat_RD": {
+      "profiler_host_entry_skew_us": 392.96,
+      "all_device_span_us_by_rank": [5625.928, 5627.091875, 5619.04, 5500.42, 5760.36, 5179.28, 5777.847125, 5448.28],
+      "gemm_count_by_rank": [0, 2, 4, 4, 6, 6, 6, 6],
+      "gemm_duration_sum_us_by_rank": [0, 30.015749999999997, 60.959999999999994, 61.46, 88.74000000000001, 88.28, 88.44912500000001, 87.56],
+      "categories": {
+        "aicpu_dispatch": {
+          "count_by_rank": [8, 8, 8, 8, 8, 8, 8, 8],
+          "union_us_by_rank": [1079.61125, 1112.52425, 1129.72, 1141.18, 1125.92, 1124.22, 1154.0215, 1059.86]
+        },
+        "arithmetic_or_layout": {
+          "count_by_rank": [5, 8, 10, 10, 12, 12, 11, 11],
+          "union_us_by_rank": [40.065625, 82.4485, 122.18, 123.5, 146.04, 142.9, 138.14325, 129.76]
+        },
+        "other_device_tasks": {
+          "count_by_rank": [76, 96, 106, 106, 107, 107, 97, 78],
+          "union_us_by_rank": [7.9415, 10.95825, 12.3, 12.6, 12.58, 12.26, 10.87825, 7.86]
+        },
+        "sdma_tasks": {
+          "count_by_rank": [24, 28, 30, 30, 30, 30, 28, 24],
+          "union_us_by_rank": [1264.917, 2114.763625, 2726.68, 2651.72, 2801.28, 2727.5, 2407.791125, 1853.26]
+        },
+        "wait_tasks": {
+          "count_by_rank": [72, 88, 96, 96, 96, 96, 88, 72],
+          "union_us_by_rank": [5370.9325, 5224.1485, 5196.02, 5048.26, 5203.38, 3929.54, 5411.2705, 5155.56]
+        }
+      },
+      "unmapped_arithmetic_or_layout_count_by_rank": [0, 0, 0, 0, 0, 0, 0, 0]
+    },
+    "head_g2_RD": {
+      "profiler_host_entry_skew_us": 126.97,
+      "all_device_span_us_by_rank": [5945.471625, 6053.95225, 6235.16, 6263.98, 6201.44, 6426.6, 6356.6775, 6371.38],
+      "gemm_count_by_rank": [4, 4, 6, 6, 8, 8, 8, 8],
+      "gemm_duration_sum_us_by_rank": [41.105624999999996, 40.85424999999999, 66.66, 66.67999999999999, 87.29999999999998, 86.64, 85.76974999999999, 85.24],
+      "categories": {
+        "aicpu_dispatch": {
+          "count_by_rank": [6, 6, 6, 6, 6, 6, 6, 6],
+          "union_us_by_rank": [851.95925, 913.711875, 895.86, 1019.92, 873.36, 937.7, 819.14175, 938.66]
+        },
+        "arithmetic_or_layout": {
+          "count_by_rank": [27, 27, 29, 29, 31, 31, 31, 31],
+          "union_us_by_rank": [185.026, 187.154, 224.1, 223.9, 237.96, 243.0, 244.19075, 239.68]
+        },
+        "collective_or_p2p_aggregate": {
+          "count_by_rank": [4, 4, 4, 4, 4, 4, 4, 4],
+          "union_us_by_rank": [2627.068, 1358.229, 2283.8, 1229.52, 2418.7, 1413.86, 2876.353, 1203.38]
+        },
+        "other_device_tasks": {
+          "count_by_rank": [87, 87, 107, 107, 108, 108, 88, 88],
+          "union_us_by_rank": [18.40275, 22.296625, 19.88, 20.3, 20.64, 20.46, 17.6185, 18.36]
+        },
+        "sdma_tasks": {
+          "count_by_rank": [42, 42, 46, 46, 46, 46, 42, 42],
+          "union_us_by_rank": [1561.55825, 1477.97325, 1989.34, 1989.84, 2027.46, 2028.72, 1749.43025, 1707.8]
+        },
+        "wait_tasks": {
+          "count_by_rank": [78, 78, 94, 94, 94, 94, 78, 78],
+          "union_us_by_rank": [4842.47725, 5410.6625, 5299.56, 5358.28, 4337.74, 5027.94, 5550.274125, 3458.16]
+        }
+      },
+      "unmapped_arithmetic_or_layout_count_by_rank": [0, 0, 0, 0, 0, 0, 0, 0]
+    },
+    "cached_tree": {
+      "profiler_host_entry_skew_us": 795.31,
+      "all_device_span_us_by_rank": [6039.88475, 6141.04025, 5303.4, 6175.9, 6156.5, 5343.4, 6131.28375, 6065.52],
+      "gemm_count_by_rank": [0, 4, 0, 8, 0, 4, 0, 12],
+      "gemm_duration_sum_us_by_rank": [0, 57.312, 0, 109.33999999999999, 0, 57.42, 0, 159.22],
+      "categories": {
+        "arithmetic_or_layout": {
+          "count_by_rank": [3, 17, 3, 31, 3, 17, 3, 45],
+          "union_us_by_rank": [15.86225, 147.039375, 16.48, 271.68, 15.66, 151.68, 15.95825, 395.02]
+        },
+        "collective_or_p2p_aggregate": {
+          "count_by_rank": [4, 8, 4, 12, 4, 8, 4, 12],
+          "union_us_by_rank": [5762.946, 5741.377, 5030.0, 5649.9, 5882.4, 4929.96, 5650.181, 5410.78]
+        },
+        "other_device_tasks": {
+          "count_by_rank": [20, 40, 20, 60, 20, 40, 20, 60],
+          "union_us_by_rank": [5.900875, 12.05875, 5.66, 17.7, 5.88, 11.72, 5.939375, 17.72]
+        },
+        "sdma_tasks": {
+          "count_by_rank": [14, 28, 14, 42, 14, 28, 14, 42],
+          "union_us_by_rank": [581.06175, 1385.286, 656.78, 2342.8, 657.08, 1611.32, 656.700875, 2720.28]
+        },
+        "wait_tasks": {
+          "count_by_rank": [16, 32, 16, 48, 16, 32, 16, 48],
+          "union_us_by_rank": [5758.04575, 5908.233, 5026.1, 5956.92, 5881.64, 5022.68, 5645.78175, 5843.06]
+        }
+      },
+      "unmapped_arithmetic_or_layout_count_by_rank": [0, 0, 0, 0, 0, 0, 0, 0]
+    }
+  },
+  "head_g2_stages": {
+    "forward/scatter_SM": {
+      "arithmetic_or_layout_union_us_by_rank": [8.181125, 8.35875, 8.2, 8.3, 8.36, 8.76, 8.479, 8.42],
+      "collective_aggregate_duration_us_by_rank": [
+        [393.115],
+        [551.223],
+        [392.64],
+        [417.42],
+        [393.0],
+        [601.78],
+        [459.544],
+        [393.94]
+      ]
+    },
+    "forward/compose_group": {
+      "arithmetic_or_layout_union_us_by_rank": [39.705625, 41.61425, 42.0, 43.78, 41.32, 43.94, 42.394875, 41.3],
+      "collective_aggregate_duration_us_by_rank": [
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        []
+      ]
+    },
+    "forward/outer_RD": {
+      "arithmetic_or_layout_union_us_by_rank": [20.683, 22.536875, 45.94, 41.58, 59.6, 60.38, 60.552625, 59.44],
+      "collective_aggregate_duration_us_by_rank": [
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        []
+      ]
+    },
+    "forward/local_prefix": {
+      "arithmetic_or_layout_union_us_by_rank": [18.602625, 18.81725, 22.16, 24.08, 22.14, 21.28, 21.6175, 21.32],
+      "collective_aggregate_duration_us_by_rank": [
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        []
+      ]
+    },
+    "forward/restore_H": {
+      "arithmetic_or_layout_union_us_by_rank": [6.08075, 6.659125, 7.1, 7.96, 6.74, 7.56, 7.279125, 6.8],
+      "collective_aggregate_duration_us_by_rank": [
+        [1447.963],
+        [208.011],
+        [1138.06],
+        [209.18],
+        [1034.52],
+        [209.24],
+        [1398.352],
+        [209.08]
+      ]
+    },
+    "backward/scatter_GM": {
+      "arithmetic_or_layout_union_us_by_rank": [8.341125, 8.438875, 8.8, 9.02, 8.66, 8.6, 9.118875, 9.26],
+      "collective_aggregate_duration_us_by_rank": [
+        [392.995],
+        [390.565],
+        [394.4],
+        [393.24],
+        [393.96],
+        [392.88],
+        [477.302],
+        [393.98]
+      ]
+    },
+    "backward/compose_group": {
+      "arithmetic_or_layout_union_us_by_rank": [28.344, 27.09625, 27.54, 28.0, 27.38, 28.18, 28.076625, 27.56],
+      "collective_aggregate_duration_us_by_rank": [
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        []
+      ]
+    },
+    "backward/outer_RD": {
+      "arithmetic_or_layout_union_us_by_rank": [11.62175, 11.718375, 19.68, 20.12, 22.32, 22.34, 22.65725, 23.46],
+      "collective_aggregate_duration_us_by_rank": [
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        []
+      ]
+    },
+    "backward/local_suffix": {
+      "arithmetic_or_layout_union_us_by_rank": [18.2425, 18.177375, 17.88, 17.64, 18.3, 17.66, 17.358, 17.4],
+      "collective_aggregate_duration_us_by_rank": [
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        []
+      ]
+    },
+    "backward/restore_D": {
+      "arithmetic_or_layout_union_us_by_rank": [6.320875, 5.87925, 5.9, 5.86, 5.88, 5.84, 6.61925, 6.22],
+      "collective_aggregate_duration_us_by_rank": [
+        [392.995],
+        [208.43],
+        [358.7],
+        [209.68],
+        [597.22],
+        [209.96],
+        [541.155],
+        [206.38]
+      ]
+    }
+  },
+  "restore_rank6_rank7_join": {
+    "forward": {
+      "rank7_minus_rank6_start_us": 1248.505,
+      "rank7_minus_rank6_end_us": 59.233,
+      "rank6_aggregate_duration_us": 1398.352,
+      "rank7_aggregate_duration_us": 209.08
+    },
+    "backward": {
+      "rank7_minus_rank6_start_us": 390.578,
+      "rank7_minus_rank6_end_us": 55.803,
+      "rank6_aggregate_duration_us": 541.155,
+      "rank7_aggregate_duration_us": 206.38
+    }
+  }
+}

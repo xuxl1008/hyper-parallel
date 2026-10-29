@@ -1,0 +1,275 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "source_artifact": "rd_protocol_qualification_20261029/real_cp8_4k_npu.json",
+    "source_sha256": "d5df3f6f0b0d714b42290e8ee3f547445eda19e6f985ca107fd19395cdedc97d"
+  },
+  "measurement_date": "2026-10-29",
+  "implementation_scope": "Historical implementations identified by recorded source SHA256; not a new NPU run of the portable torch-native archive.",
+  "recorded_source_sha256": {
+    "flat_RD": "dde82861d4587a4b7236bd090b74715ccdc46eb6b93c710dad5fbe801f82b4cc",
+    "head_owner": "f5d4963842cc03507e38d93cc5f1d82e168a501c75a8cb98f175cdce27ad918f",
+    "cached_tree": "620feb64fecf955c9196d02d627b46a8a8a7beef6cb90dd4682ce7cd2484c952",
+    "adapter": "91391ae96c8a50768639f83b505e891a21ce9d494ccdc667f5ab9c4f13560dd6",
+    "RD_pointwise": "bc77fc600f197daa592ab0a00db20fb7ee6a192278f0e307f0dddc1afa8a37c1"
+  },
+  "recorded_worker_sha256": "bb63067a10109d73535106cf64da167e7875b5711ec96ce1747701007937d898",
+  "input": {
+    "device_kind": "npu",
+    "world_size": 8,
+    "case": "long",
+    "batch": 1,
+    "heads": 96,
+    "state_key_dim": 128,
+    "state_value_dim": 128,
+    "summary_shape": [1, 96, 128, 128],
+    "summary_dtype": "float32",
+    "reference_dtype": "float64",
+    "head_group_width": 2,
+    "source_capture_ranks": 8,
+    "repeat_captures": false,
+    "local_tokens": 4096,
+    "document": "one long document; matched FLA capture at measurement time",
+    "input_scope": "Same captured S/M/G affine summaries; no local summary production or complete KDA core in protocol timing."
+  },
+  "qualification": {
+    "pass": true,
+    "scope": "FP32 protocols vs independent FP64 affine reference. Not local KDA/training qualification.",
+    "constructor_scope": "Natural WORLD only; head DeviceMesh ctor is bypassed with precreated groups.",
+    "gate": "norm(error)<=2e-6*norm(reference)+1e-11; algebra isolation, not model training tolerance.",
+    "reset_case_in_this_measurement": false,
+    "reset_scope_note": "The recorded run contains only long. The source driver describes structural M=0 algebra controls, not communication pruning."
+  },
+  "timing_method": {
+    "warmup": 3,
+    "iterations": 10,
+    "scope": "Unprofiled protocol-only synchronized forward and backward.",
+    "reported_statistic": "median_i(max_rank(forward_ms[rank,i] + backward_ms[rank,i]))",
+    "rank_array_order": [0, 1, 2, 3, 4, 5, 6, 7],
+    "allocator_scope": "Measured NPU allocated-memory deltas from the recorded protocol run; not reserved memory or an analytical cache estimate."
+  },
+  "protocols": {
+    "flat_RD": {
+      "pass": true,
+      "fp64_reference": {
+        "H": {
+          "relative_l2_by_rank": [0.0, 0.0, 2.532759165337986e-08, 3.4960408926401424e-08, 3.497769935713507e-08, 3.498334655091628e-08, 3.500429261035738e-08, 3.502963773282342e-08],
+          "max_abs_by_rank": [0.0, 0.0, 1.802293744801453e-09, 2.248030352147712e-09, 2.3069075261172856e-09, 2.483311715983927e-09, 2.07716674416325e-09, 2.1250222692614784e-09],
+          "worst_head_relative_l2_by_rank": [0.0, 0.0, 2.590663760298175e-08, 3.5794817438687524e-08, 3.592190364589116e-08, 3.6141825433775764e-08, 3.57356239153763e-08, 3.620749346201129e-08],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        },
+        "D": {
+          "relative_l2_by_rank": [3.58121939817052e-08, 3.5817716751601734e-08, 3.579210004213331e-08, 3.573920751216116e-08, 3.5853737845492324e-08, 2.5326264888867017e-08, 0.0, 0.0],
+          "max_abs_by_rank": [3.6654812449188334e-09, 3.2038202438244845e-09, 3.367256813657793e-09, 3.5377713605844185e-09, 3.4372597892962098e-09, 1.8621573866228758e-09, 0.0, 0.0],
+          "worst_head_relative_l2_by_rank": [3.692583174832849e-08, 3.6803640957945725e-08, 3.659801134754992e-08, 3.6967632034094696e-08, 3.652476483088317e-08, 2.5815997050874427e-08, 0.0, 0.0],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        },
+        "second_H": {
+          "relative_l2_by_rank": [0.0, 0.0, 2.5328148475646085e-08, 3.4887700669644116e-08, 3.486988077964464e-08, 3.4893956631962183e-08, 3.496113794651828e-08, 3.4933741643799204e-08],
+          "max_abs_by_rank": [0.0, 0.0, 1.8419383657208854e-09, 2.3497387369175726e-09, 1.9799930167652136e-09, 2.3285861502908567e-09, 2.1636449090700616e-09, 2.041749234960033e-09],
+          "worst_head_relative_l2_by_rank": [0.0, 0.0, 2.595751780265959e-08, 3.5944253100986006e-08, 3.598516415664115e-08, 3.6036669694976475e-08, 3.599971241260379e-08, 3.593535964322281e-08],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        },
+        "second_D": {
+          "relative_l2_by_rank": [3.579516735196395e-08, 3.574443355453135e-08, 3.573991338109267e-08, 3.57485060042691e-08, 3.5870117267724646e-08, 2.5293234738500652e-08, 0.0, 0.0],
+          "max_abs_by_rank": [3.603865338097645e-09, 3.497873740654356e-09, 3.570681708642276e-09, 3.5003364165508977e-09, 3.6496753119674707e-09, 1.8606072099691673e-09, 0.0, 0.0],
+          "worst_head_relative_l2_by_rank": [3.686486306917422e-08, 3.6805674853877775e-08, 3.6654279173190165e-08, 3.66287131998496e-08, 3.662127373053615e-08, 2.570205968967396e-08, 0.0, 0.0],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        }
+      },
+      "vs_flat": {
+        "H": {
+          "relative_l2_by_rank": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+          "max_abs_by_rank": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+          "worst_head_relative_l2_by_rank": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        },
+        "D": {
+          "relative_l2_by_rank": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+          "max_abs_by_rank": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+          "worst_head_relative_l2_by_rank": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        }
+      },
+      "correctness_flags_by_rank": {
+        "cache_immutable": [true, true, true, true, true, true, true, true],
+        "inputs_immutable": [true, true, true, true, true, true, true, true],
+        "pass": [true, true, true, true, true, true, true, true]
+      },
+      "cache": {
+        "count_by_rank": [0, 1, 2, 2, 3, 3, 3, 3],
+        "logical_bytes_by_rank": [0, 6291456, 12582912, 12582912, 18874368, 18874368, 18874368, 18874368],
+        "unique_storage_bytes_by_rank": [0, 6291456, 12582912, 12582912, 18874368, 18874368, 18874368, 18874368],
+        "compact_by_rank": [true, true, true, true, true, true, true, true],
+        "sum_unique_storage_bytes": 106954752,
+        "max_unique_storage_bytes": 18874368
+      },
+      "allocator": {
+        "peak_allocated_delta_bytes_by_rank": [25168384, 37750784, 50334720, 50334720, 56626688, 56626688, 56626688, 56626688],
+        "live_after_forward_delta_bytes_by_rank": [6292480, 6292480, 12584448, 12584448, 18876416, 18876416, 18876416, 18876416]
+      },
+      "timing": {
+        "iteration_max_rank_total_ms": [7.14378000702709, 4.516560002230108, 4.496410023421049, 4.5950900530442595, 4.504709970206022, 4.505199962295592, 4.577660001814365, 6.727410014718771, 5.70655008777976, 4.526869975961745],
+        "iteration_argmax_rank": [1, 1, 4, 2, 4, 1, 4, 4, 2, 4],
+        "forward_ms_at_iteration_total_argmax_rank": [4.921399988234043, 2.5020400062203407, 2.4900099961087108, 2.4891800712794065, 2.506689983420074, 2.487860037945211, 2.548830001614988, 2.5371300289407372, 3.691120073199272, 2.4989700177684426],
+        "backward_ms_at_iteration_total_argmax_rank": [2.2223800187930465, 2.014519996009767, 2.0064000273123384, 2.105909981764853, 1.9980199867859483, 2.017339924350381, 2.0288300001993775, 4.190279985778034, 2.015430014580488, 2.027899958193302],
+        "median_iteration_max_rank_total_ms": 4.552264988888055,
+        "median_total_ms_by_rank": [4.490780003834516, 4.537669999990612, 4.510769969783723, 4.513424995820969, 4.552264988888055, 4.5061150449328125, 4.477790032979101, 4.4548099976964295]
+      }
+    },
+    "head_g2_RD": {
+      "pass": true,
+      "fp64_reference": {
+        "H": {
+          "relative_l2_by_rank": [0.0, 0.0, 2.532759165337986e-08, 2.53370294738421e-08, 3.497769935713507e-08, 2.531621161630634e-08, 3.500429261035738e-08, 2.5342109461695347e-08],
+          "max_abs_by_rank": [0.0, 0.0, 1.802293744801453e-09, 1.8559616898894404e-09, 2.3069075261172856e-09, 1.7825454307063282e-09, 2.07716674416325e-09, 1.8119343664357856e-09],
+          "worst_head_relative_l2_by_rank": [0.0, 0.0, 2.590663760298175e-08, 2.5889860392654e-08, 3.592190364589116e-08, 2.6072984029609042e-08, 3.57356239153763e-08, 2.602562968806355e-08],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        },
+        "D": {
+          "relative_l2_by_rank": [2.5291693618175372e-08, 3.58202171341822e-08, 2.530194918243363e-08, 3.573062674079675e-08, 2.532452026625604e-08, 2.5326264888867017e-08, 0.0, 0.0],
+          "max_abs_by_rank": [1.8587658981439326e-09, 3.2038202438244845e-09, 1.8617951763610918e-09, 3.5377713605844185e-09, 1.8592298742237112e-09, 1.8621573866228758e-09, 0.0, 0.0],
+          "worst_head_relative_l2_by_rank": [2.5663115025686975e-08, 3.67883780825691e-08, 2.5685228547493422e-08, 3.694521691263465e-08, 2.5709770169085454e-08, 2.5815997050874427e-08, 0.0, 0.0],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        },
+        "second_H": {
+          "relative_l2_by_rank": [0.0, 0.0, 2.5328148475646085e-08, 2.5317344401626785e-08, 3.486988077964464e-08, 2.5305692885558153e-08, 3.496113794651828e-08, 2.528386339976882e-08],
+          "max_abs_by_rank": [0.0, 0.0, 1.8419383657208854e-09, 1.7771586632853165e-09, 1.9799930167652136e-09, 1.7978232652593462e-09, 2.1636449090700616e-09, 1.7870504451233948e-09],
+          "worst_head_relative_l2_by_rank": [0.0, 0.0, 2.595751780265959e-08, 2.5789085155347554e-08, 3.598516415664115e-08, 2.598229870486988e-08, 3.599971241260379e-08, 2.577317299115611e-08],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        },
+        "second_D": {
+          "relative_l2_by_rank": [2.5308511161993564e-08, 3.5746629434231566e-08, 2.5295197962579503e-08, 3.574295827211284e-08, 2.534794662111746e-08, 2.5293234738500652e-08, 0.0, 0.0],
+          "max_abs_by_rank": [1.854405295986794e-09, 3.497873740654356e-09, 1.8609100926880728e-09, 3.5003364165508977e-09, 1.863049756134494e-09, 1.8606072099691673e-09, 0.0, 0.0],
+          "worst_head_relative_l2_by_rank": [2.586569741266912e-08, 3.6805737631170364e-08, 2.5872581512292132e-08, 3.651818632037511e-08, 2.586219579005658e-08, 2.570205968967396e-08, 0.0, 0.0],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        }
+      },
+      "vs_flat": {
+        "H": {
+          "relative_l2_by_rank": [0.0, 0.0, 0.0, 4.240125542629447e-08, 0.0, 4.2489363009253766e-08, 0.0, 4.248006078664876e-08],
+          "max_abs_by_rank": [0.0, 0.0, 0.0, 3.725290298461914e-09, 0.0, 3.725290298461914e-09, 0.0, 3.725290298461914e-09],
+          "worst_head_relative_l2_by_rank": [0.0, 0.0, 0.0, 4.4054122262508525e-08, 0.0, 4.47638086164038e-08, 0.0, 4.490714487059962e-08],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        },
+        "D": {
+          "relative_l2_by_rank": [4.381429496251309e-08, 6.520321308624484e-09, 4.38184867063089e-08, 6.4789342357739015e-09, 4.3948470454238896e-08, 0.0, 0.0, 0.0],
+          "max_abs_by_rank": [3.725290298461914e-09, 3.725290298461914e-09, 3.725290298461914e-09, 3.725290298461914e-09, 3.725290298461914e-09, 0.0, 0.0, 0.0],
+          "worst_head_relative_l2_by_rank": [4.521574581183269e-08, 8.471081606430811e-09, 4.532016254538348e-08, 7.947676253182327e-09, 4.536647071986464e-08, 0.0, 0.0, 0.0],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        }
+      },
+      "correctness_flags_by_rank": {
+        "cache_immutable": [true, true, true, true, true, true, true, true],
+        "inputs_immutable": [true, true, true, true, true, true, true, true],
+        "pass": [true, true, true, true, true, true, true, true]
+      },
+      "cache": {
+        "count_by_rank": [1, 1, 2, 2, 3, 3, 3, 3],
+        "logical_bytes_by_rank": [6291456, 6291456, 9437184, 9437184, 12582912, 12582912, 12582912, 12582912],
+        "unique_storage_bytes_by_rank": [6291456, 6291456, 9437184, 9437184, 12582912, 12582912, 12582912, 12582912],
+        "compact_by_rank": [true, true, true, true, true, true, true, true],
+        "sum_unique_storage_bytes": 81788928,
+        "max_unique_storage_bytes": 12582912
+      },
+      "allocator": {
+        "peak_allocated_delta_bytes_by_rank": [47190016, 47190016, 53481984, 53481984, 56628224, 56628224, 56628224, 56628224],
+        "live_after_forward_delta_bytes_by_rank": [6291968, 6291968, 9438208, 9438208, 12584448, 12584448, 12584448, 12584448]
+      },
+      "timing": {
+        "iteration_max_rank_total_ms": [5.870910012163222, 5.472269956953824, 5.49271993804723, 5.532709998078644, 5.471470067277551, 5.466980044730008, 5.452150013297796, 5.426330026239157, 5.865709972567856, 5.364389973692596],
+        "iteration_argmax_rank": [7, 6, 6, 6, 6, 7, 6, 6, 6, 6],
+        "forward_ms_at_iteration_total_argmax_rank": [3.3707100665196776, 2.9396599857136607, 2.9457799391821027, 2.888259943574667, 2.9338300228118896, 2.9185099992901087, 2.9485300183296204, 2.917189965955913, 3.308120067231357, 2.9018399072811007],
+        "backward_ms_at_iteration_total_argmax_rank": [2.500199945643544, 2.532609971240163, 2.5469399988651276, 2.6444500545039773, 2.537640044465661, 2.548470045439899, 2.503619994968176, 2.5091400602832437, 2.557589905336499, 2.462550066411495],
+        "median_iteration_max_rank_total_ms": 5.471870012115687,
+        "median_total_ms_by_rank": [5.2345849690027535, 5.230379989370704, 5.203380016610026, 5.235780030488968, 5.27134002186358, 5.265194980893284, 5.471870012115687, 5.452260025776923]
+      }
+    },
+    "cached_tree": {
+      "pass": true,
+      "fp64_reference": {
+        "H": {
+          "relative_l2_by_rank": [0.0, 0.0, 2.532759165337986e-08, 2.53370294738421e-08, 3.497769935713507e-08, 2.531621161630634e-08, 3.500428643445259e-08, 2.5342109461695347e-08],
+          "max_abs_by_rank": [0.0, 0.0, 1.802293744801453e-09, 1.8559616898894404e-09, 2.3069075261172856e-09, 1.7825454307063282e-09, 2.07716674416325e-09, 1.8119343664357856e-09],
+          "worst_head_relative_l2_by_rank": [0.0, 0.0, 2.590663760298175e-08, 2.5889860392654e-08, 3.592190364589116e-08, 2.6072984029609042e-08, 3.57356239153763e-08, 2.602562968806355e-08],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        },
+        "D": {
+          "relative_l2_by_rank": [2.5291693618175372e-08, 3.5820189760330764e-08, 2.530194918243363e-08, 3.573062674079675e-08, 2.532452026625604e-08, 2.5326264888867017e-08, 0.0, 0.0],
+          "max_abs_by_rank": [1.8587658981439326e-09, 3.2038202438244845e-09, 1.8617951763610918e-09, 3.5377713605844185e-09, 1.8592298742237112e-09, 1.8621573866228758e-09, 0.0, 0.0],
+          "worst_head_relative_l2_by_rank": [2.5663115025686975e-08, 3.6788378082666207e-08, 2.5685228547493422e-08, 3.694521691263465e-08, 2.5709770169085454e-08, 2.5815997050874427e-08, 0.0, 0.0],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        },
+        "second_H": {
+          "relative_l2_by_rank": [0.0, 0.0, 2.5328148475646085e-08, 2.5317344401626785e-08, 3.486988077964464e-08, 2.5305692885558153e-08, 3.496113801799113e-08, 2.528386339976882e-08],
+          "max_abs_by_rank": [0.0, 0.0, 1.8419383657208854e-09, 1.7771586632853165e-09, 1.9799930167652136e-09, 1.7978232652593462e-09, 2.1636449090700616e-09, 1.7870504451233948e-09],
+          "worst_head_relative_l2_by_rank": [0.0, 0.0, 2.595751780265959e-08, 2.5789085155347554e-08, 3.598516415664115e-08, 2.598229870486988e-08, 3.599971241260379e-08, 2.577317299115611e-08],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        },
+        "second_D": {
+          "relative_l2_by_rank": [2.530851116246706e-08, 3.574674156931264e-08, 2.5295197962579503e-08, 3.574295827211284e-08, 2.534794662111746e-08, 2.5293234738500652e-08, 0.0, 0.0],
+          "max_abs_by_rank": [1.854405295986794e-09, 3.497873740654356e-09, 1.8609100926880728e-09, 3.5003364165508977e-09, 1.863049756134494e-09, 1.8606072099691673e-09, 0.0, 0.0],
+          "worst_head_relative_l2_by_rank": [2.586569741266912e-08, 3.6805737650410605e-08, 2.5872581512292132e-08, 3.651818632037511e-08, 2.586219579005658e-08, 2.570205968967396e-08, 0.0, 0.0],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        }
+      },
+      "vs_flat": {
+        "H": {
+          "relative_l2_by_rank": [0.0, 0.0, 0.0, 4.240125542629447e-08, 0.0, 4.2489363009253766e-08, 2.2960800410980432e-11, 4.248006078664876e-08],
+          "max_abs_by_rank": [0.0, 0.0, 0.0, 3.725290298461914e-09, 0.0, 3.725290298461914e-09, 1.1641532182693481e-10, 3.725290298461914e-09],
+          "worst_head_relative_l2_by_rank": [0.0, 0.0, 0.0, 4.4054122262508525e-08, 0.0, 4.47638086164038e-08, 2.2373930886033087e-10, 4.490714487059962e-08],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        },
+        "D": {
+          "relative_l2_by_rank": [4.381429496251309e-08, 6.5199725566410875e-09, 4.38184867063089e-08, 6.4789342357739015e-09, 4.3948470454238896e-08, 0.0, 0.0, 0.0],
+          "max_abs_by_rank": [3.725290298461914e-09, 3.725290298461914e-09, 3.725290298461914e-09, 3.725290298461914e-09, 3.725290298461914e-09, 0.0, 0.0, 0.0],
+          "worst_head_relative_l2_by_rank": [4.521574581183269e-08, 8.471081606430811e-09, 4.532016254538348e-08, 7.947676253182327e-09, 4.536647071986464e-08, 0.0, 0.0, 0.0],
+          "finite_by_rank": [true, true, true, true, true, true, true, true],
+          "pass_by_rank": [true, true, true, true, true, true, true, true]
+        }
+      },
+      "correctness_flags_by_rank": {
+        "cache_immutable": [true, true, true, true, true, true, true, true],
+        "inputs_immutable": [true, true, true, true, true, true, true, true],
+        "pass": [true, true, true, true, true, true, true, true]
+      },
+      "cache": {
+        "count_by_rank": [0, 2, 0, 4, 0, 2, 0, 6],
+        "logical_bytes_by_rank": [0, 12582912, 0, 25165824, 0, 12582912, 0, 37748736],
+        "unique_storage_bytes_by_rank": [0, 12582912, 0, 25165824, 0, 12582912, 0, 37748736],
+        "compact_by_rank": [true, true, true, true, true, true, true, true],
+        "sum_unique_storage_bytes": 88080384,
+        "max_unique_storage_bytes": 37748736
+      },
+      "allocator": {
+        "peak_allocated_delta_bytes_by_rank": [25167360, 75502592, 25167360, 94378496, 25167360, 75502592, 25167360, 113254400],
+        "live_after_forward_delta_bytes_by_rank": [6291968, 18875904, 6291968, 31459840, 6291968, 18875904, 6291968, 44043776]
+      },
+      "timing": {
+        "iteration_max_rank_total_ms": [9.38028993550688, 5.969129968434572, 6.016839994117618, 6.053849938325584, 6.016639992594719, 5.969880032353103, 5.96215995028615, 5.966129945591092, 5.926429992541671, 5.925150006078184],
+        "iteration_argmax_rank": [3, 0, 4, 0, 0, 4, 4, 4, 4, 4],
+        "forward_ms_at_iteration_total_argmax_rank": [6.724349921569228, 3.3049399498850107, 3.4682799596339464, 3.402199945412576, 3.2573400530964136, 3.4051500260829926, 3.4513300051912665, 3.472579992376268, 3.439849941059947, 3.4103100188076496],
+        "backward_ms_at_iteration_total_argmax_rank": [2.655940013937652, 2.6641900185495615, 2.548560034483671, 2.6516499929130077, 2.7592999394983053, 2.5647300062701106, 2.5108299450948834, 2.493549953214824, 2.486580051481724, 2.514839987270534],
+        "median_iteration_max_rank_total_ms": 5.969505000393838,
+        "median_total_ms_by_rank": [5.954720021691173, 5.896545015275478, 5.950024933554232, 5.96574496012181, 5.968004988972098, 5.947105004452169, 5.921425006818026, 5.942019983194768]
+      }
+    }
+  }
+}

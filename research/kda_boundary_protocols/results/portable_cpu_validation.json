@@ -1,0 +1,1790 @@
+{
+  "schema_version": 1,
+  "implementation_scope": "Portable normal-import modules using the installed current RD",
+  "device": "cpu",
+  "backend": "gloo",
+  "validation_date": "2026-10-30",
+  "pass": true,
+  "scope": "Two live forward calls, reverse backward, FP64 affine reference, immutable inputs/caches; g2 bytes",
+  "timing_scope": "Concurrent CPU smoke jobs with one sample; timing omitted and not evidence of performance",
+  "post_run_change": "Manifest only: optional NPU epilogue hash added; protocol bodies and worker unchanged",
+  "gate": "norm(error)<=2e-6*norm(reference)+1e-11; all g2 H/D and both invocation caches bytewise vs baseline",
+  "runs": [
+    {
+      "label": "protocols_cp4_b2",
+      "world_size": 4,
+      "input_shape": [
+        2,
+        4,
+        128,
+        128
+      ],
+      "config": {
+        "device": "cpu",
+        "variants": [
+          "baseline",
+          "lifetime",
+          "direct"
+        ],
+        "protocols": [
+          "flat",
+          "head",
+          "tree"
+        ],
+        "group_width": 2,
+        "heads": 4,
+        "batch": 2,
+        "seed": 20261029,
+        "source_ranks": 8,
+        "repeat_captures": false,
+        "force_public": false,
+        "warmup": 0,
+        "iterations": 1,
+        "cases": "both",
+        "profile_only": false,
+        "suite": "protocols",
+        "input_kind": "synthetic",
+        "profiles_requested": false
+      },
+      "pass": true,
+      "sources_at_run": {
+        "hyper_parallel.distributed.context_parallel.kimi_delta_attention_rd": {
+          "sha256": "b8b1fa04fe5e95fd2a0feb263fbf195b3475c221a5ce4b788e959797af9dd257"
+        },
+        "hyper_parallel.distributed.context_parallel.kimi_delta_attention_rd_plan": {
+          "sha256": "da00615e4384e35f7a3749e19e9663f9c9b165168bbbb3a1cfb841b2d77a0c64"
+        },
+        "research.rd_publish_20261030.archive_staging.cached_tree": {
+          "sha256": "21215c9450dec0ee5c34f92ddc32d865b4759a75b89c025d2a80a8c11753769b"
+        },
+        "research.rd_publish_20261030.archive_staging.head_owner_rd": {
+          "sha256": "0e49791975182f942f7c9f7666eb386106cea232b3b22546b6db789445e41ace"
+        },
+        "research.rd_publish_20261030.archive_staging.head_rd_lifetime": {
+          "sha256": "afef1a244be459a67cd64805e1ab6d1a5662a7b8738bab6f24bc1b0e1af44f47"
+        },
+        "research.rd_publish_20261030.archive_staging.protocol_sources": {
+          "sha256": "4e5410504a28ba068936f7146399774fac20fb17c3a4d75b14a06a77c60e303e"
+        }
+      },
+      "worker_sha256": "98e299c3804bf2db93b057da4429f78bec8af1b988400fb8a5401aa5a4c74959",
+      "benchmark_sha256": "8faa2aeb7f72d830066450c954ee1f5b305c4019b54aa0d2927bfec77a6454bb",
+      "cases": {
+        "long": {
+          "flat_RD": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              0,
+              524288,
+              1048576,
+              1048576
+            ],
+            "cache_sum_bytes": 2621440,
+            "cache_max_bytes": 1048576,
+            "max_relative_l2": {
+              "H": 1.8426615222149587e-07,
+              "D": 1.8491628328535739e-07,
+              "second_H": 1.8400700888563215e-07,
+              "second_D": 1.8248839992428956e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true
+          },
+          "head_g2_RD": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              524288,
+              524288,
+              786432,
+              786432
+            ],
+            "cache_sum_bytes": 2621440,
+            "cache_max_bytes": 786432,
+            "max_relative_l2": {
+              "H": 1.9179315024288346e-07,
+              "D": 1.926412676821624e-07,
+              "second_H": 1.922714334976365e-07,
+              "second_D": 1.9099696273534813e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 2.665504218548529e-07,
+              "D": 2.6670816176689975e-07,
+              "second_H": 2.655852564652302e-07,
+              "second_D": 2.6329868859958756e-07
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true
+          },
+          "cached_tree": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              0,
+              1048576,
+              0,
+              2097152
+            ],
+            "cache_sum_bytes": 3145728,
+            "cache_max_bytes": 2097152,
+            "max_relative_l2": {
+              "H": 1.9179315024288346e-07,
+              "D": 1.926412676821624e-07,
+              "second_H": 1.922714334976365e-07,
+              "second_D": 1.9099696273534813e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 2.665504218548529e-07,
+              "D": 2.6670816176689975e-07,
+              "second_H": 2.655852564652302e-07,
+              "second_D": 2.6329868859958756e-07
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true
+          }
+        },
+        "reset": {
+          "flat_RD": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              0,
+              524288,
+              1048576,
+              1048576
+            ],
+            "cache_sum_bytes": 2621440,
+            "cache_max_bytes": 1048576,
+            "max_relative_l2": {
+              "H": 1.3815111261365336e-07,
+              "D": 1.3974490714784065e-07,
+              "second_H": 1.3907542192366906e-07,
+              "second_D": 1.384990647213581e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true
+          },
+          "head_g2_RD": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              524288,
+              524288,
+              786432,
+              786432
+            ],
+            "cache_sum_bytes": 2621440,
+            "cache_max_bytes": 786432,
+            "max_relative_l2": {
+              "H": 1.3815111261365336e-07,
+              "D": 1.3974490714784065e-07,
+              "second_H": 1.3907542192366906e-07,
+              "second_D": 1.384990647213581e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true
+          },
+          "cached_tree": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              0,
+              1048576,
+              0,
+              2097152
+            ],
+            "cache_sum_bytes": 3145728,
+            "cache_max_bytes": 2097152,
+            "max_relative_l2": {
+              "H": 1.3815111261365336e-07,
+              "D": 1.3974490714784065e-07,
+              "second_H": 1.3907542192366906e-07,
+              "second_D": 1.384990647213581e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true
+          }
+        }
+      }
+    },
+    {
+      "label": "protocols_cp6_b1",
+      "world_size": 6,
+      "input_shape": [
+        1,
+        4,
+        128,
+        128
+      ],
+      "config": {
+        "device": "cpu",
+        "variants": [
+          "baseline",
+          "lifetime",
+          "direct"
+        ],
+        "protocols": [
+          "flat",
+          "head",
+          "tree"
+        ],
+        "group_width": 2,
+        "heads": 4,
+        "batch": 1,
+        "seed": 20261029,
+        "source_ranks": 8,
+        "repeat_captures": false,
+        "force_public": false,
+        "warmup": 0,
+        "iterations": 1,
+        "cases": "both",
+        "profile_only": false,
+        "suite": "protocols",
+        "input_kind": "synthetic",
+        "profiles_requested": false
+      },
+      "pass": true,
+      "sources_at_run": {
+        "hyper_parallel.distributed.context_parallel.kimi_delta_attention_rd": {
+          "sha256": "b8b1fa04fe5e95fd2a0feb263fbf195b3475c221a5ce4b788e959797af9dd257"
+        },
+        "hyper_parallel.distributed.context_parallel.kimi_delta_attention_rd_plan": {
+          "sha256": "da00615e4384e35f7a3749e19e9663f9c9b165168bbbb3a1cfb841b2d77a0c64"
+        },
+        "research.rd_publish_20261030.archive_staging.cached_tree": {
+          "sha256": "21215c9450dec0ee5c34f92ddc32d865b4759a75b89c025d2a80a8c11753769b"
+        },
+        "research.rd_publish_20261030.archive_staging.head_owner_rd": {
+          "sha256": "0e49791975182f942f7c9f7666eb386106cea232b3b22546b6db789445e41ace"
+        },
+        "research.rd_publish_20261030.archive_staging.head_rd_lifetime": {
+          "sha256": "afef1a244be459a67cd64805e1ab6d1a5662a7b8738bab6f24bc1b0e1af44f47"
+        },
+        "research.rd_publish_20261030.archive_staging.protocol_sources": {
+          "sha256": "4e5410504a28ba068936f7146399774fac20fb17c3a4d75b14a06a77c60e303e"
+        }
+      },
+      "worker_sha256": "98e299c3804bf2db93b057da4429f78bec8af1b988400fb8a5401aa5a4c74959",
+      "benchmark_sha256": "8faa2aeb7f72d830066450c954ee1f5b305c4019b54aa0d2927bfec77a6454bb",
+      "cases": {
+        "long": {
+          "flat_RD": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              0,
+              262144,
+              524288,
+              524288,
+              786432,
+              786432
+            ],
+            "cache_sum_bytes": 2883584,
+            "cache_max_bytes": 786432,
+            "max_relative_l2": {
+              "H": 2.489028916446411e-07,
+              "D": 2.5023010840525127e-07,
+              "second_H": 2.4406341803689807e-07,
+              "second_D": 2.4384438446130374e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true
+          },
+          "head_g2_RD": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              262144,
+              262144,
+              393216,
+              393216,
+              524288,
+              524288
+            ],
+            "cache_sum_bytes": 2359296,
+            "cache_max_bytes": 524288,
+            "max_relative_l2": {
+              "H": 2.5190179406440475e-07,
+              "D": 2.5321987440079826e-07,
+              "second_H": 2.5166165545480263e-07,
+              "second_D": 2.536184435683912e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 3.512334820925722e-07,
+              "D": 3.4069315863432485e-07,
+              "second_H": 3.509321839632172e-07,
+              "second_D": 3.394982124926486e-07
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true
+          },
+          "cached_tree": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              0,
+              0,
+              1048576,
+              0,
+              0,
+              1572864
+            ],
+            "cache_sum_bytes": 2621440,
+            "cache_max_bytes": 1572864,
+            "max_relative_l2": {
+              "H": 2.587866495294851e-07,
+              "D": 2.4993163588153325e-07,
+              "second_H": 2.577052571327485e-07,
+              "second_D": 2.481457255643873e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 3.2972818561707463e-07,
+              "D": 3.263389712698962e-07,
+              "second_H": 3.2662247972122726e-07,
+              "second_D": 3.224688700733588e-07
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true
+          }
+        },
+        "reset": {
+          "flat_RD": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              0,
+              262144,
+              524288,
+              524288,
+              786432,
+              786432
+            ],
+            "cache_sum_bytes": 2883584,
+            "cache_max_bytes": 786432,
+            "max_relative_l2": {
+              "H": 1.3944981066272712e-07,
+              "D": 1.3976044042121562e-07,
+              "second_H": 1.3845558499873745e-07,
+              "second_D": 1.3879756224381494e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true
+          },
+          "head_g2_RD": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              262144,
+              262144,
+              393216,
+              393216,
+              524288,
+              524288
+            ],
+            "cache_sum_bytes": 2359296,
+            "cache_max_bytes": 524288,
+            "max_relative_l2": {
+              "H": 1.3944981066272712e-07,
+              "D": 1.3976044042121562e-07,
+              "second_H": 1.3845558499873745e-07,
+              "second_D": 1.3879756224381494e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true
+          },
+          "cached_tree": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              0,
+              0,
+              1048576,
+              0,
+              0,
+              1572864
+            ],
+            "cache_sum_bytes": 2621440,
+            "cache_max_bytes": 1572864,
+            "max_relative_l2": {
+              "H": 1.3944981066272712e-07,
+              "D": 1.3976044042121562e-07,
+              "second_H": 1.3845558499873745e-07,
+              "second_D": 1.3879756224381494e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true
+          }
+        }
+      }
+    },
+    {
+      "label": "g2_cp4_b2",
+      "world_size": 4,
+      "input_shape": [
+        2,
+        4,
+        128,
+        128
+      ],
+      "config": {
+        "device": "cpu",
+        "variants": [
+          "baseline",
+          "lifetime",
+          "direct"
+        ],
+        "protocols": [
+          "flat",
+          "head",
+          "tree"
+        ],
+        "group_width": 2,
+        "heads": 4,
+        "batch": 2,
+        "seed": 20261029,
+        "source_ranks": 8,
+        "repeat_captures": false,
+        "force_public": false,
+        "warmup": 0,
+        "iterations": 1,
+        "cases": "both",
+        "profile_only": false,
+        "suite": "g2",
+        "input_kind": "synthetic",
+        "profiles_requested": false
+      },
+      "pass": true,
+      "sources_at_run": {
+        "hyper_parallel.distributed.context_parallel.kimi_delta_attention_rd": {
+          "sha256": "b8b1fa04fe5e95fd2a0feb263fbf195b3475c221a5ce4b788e959797af9dd257"
+        },
+        "hyper_parallel.distributed.context_parallel.kimi_delta_attention_rd_plan": {
+          "sha256": "da00615e4384e35f7a3749e19e9663f9c9b165168bbbb3a1cfb841b2d77a0c64"
+        },
+        "research.rd_publish_20261030.archive_staging.cached_tree": {
+          "sha256": "21215c9450dec0ee5c34f92ddc32d865b4759a75b89c025d2a80a8c11753769b"
+        },
+        "research.rd_publish_20261030.archive_staging.head_owner_rd": {
+          "sha256": "0e49791975182f942f7c9f7666eb386106cea232b3b22546b6db789445e41ace"
+        },
+        "research.rd_publish_20261030.archive_staging.head_rd_lifetime": {
+          "sha256": "afef1a244be459a67cd64805e1ab6d1a5662a7b8738bab6f24bc1b0e1af44f47"
+        },
+        "research.rd_publish_20261030.archive_staging.protocol_sources": {
+          "sha256": "4e5410504a28ba068936f7146399774fac20fb17c3a4d75b14a06a77c60e303e"
+        }
+      },
+      "worker_sha256": "98e299c3804bf2db93b057da4429f78bec8af1b988400fb8a5401aa5a4c74959",
+      "benchmark_sha256": "8faa2aeb7f72d830066450c954ee1f5b305c4019b54aa0d2927bfec77a6454bb",
+      "cases": {
+        "long": {
+          "head_g2_RD_baseline": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              524288,
+              524288,
+              786432,
+              786432
+            ],
+            "cache_sum_bytes": 2621440,
+            "cache_max_bytes": 786432,
+            "max_relative_l2": {
+              "H": 1.9179315024288346e-07,
+              "D": 1.926412676821624e-07,
+              "second_H": 1.922714334976365e-07,
+              "second_D": 1.9099696273534813e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true,
+            "baseline_bitwise_equal": true,
+            "compared_tensor_equal_by_rank": [
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            ]
+          },
+          "head_g2_RD_lifetime": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              524288,
+              524288,
+              786432,
+              786432
+            ],
+            "cache_sum_bytes": 2621440,
+            "cache_max_bytes": 786432,
+            "max_relative_l2": {
+              "H": 1.9179315024288346e-07,
+              "D": 1.926412676821624e-07,
+              "second_H": 1.922714334976365e-07,
+              "second_D": 1.9099696273534813e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true,
+            "baseline_bitwise_equal": true,
+            "compared_tensor_equal_by_rank": [
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            ]
+          },
+          "head_g2_RD_direct": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              524288,
+              524288,
+              786432,
+              786432
+            ],
+            "cache_sum_bytes": 2621440,
+            "cache_max_bytes": 786432,
+            "max_relative_l2": {
+              "H": 1.9179315024288346e-07,
+              "D": 1.926412676821624e-07,
+              "second_H": 1.922714334976365e-07,
+              "second_D": 1.9099696273534813e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true,
+            "baseline_bitwise_equal": true,
+            "compared_tensor_equal_by_rank": [
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            ]
+          }
+        },
+        "reset": {
+          "head_g2_RD_baseline": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              524288,
+              524288,
+              786432,
+              786432
+            ],
+            "cache_sum_bytes": 2621440,
+            "cache_max_bytes": 786432,
+            "max_relative_l2": {
+              "H": 1.3815111261365336e-07,
+              "D": 1.3974490714784065e-07,
+              "second_H": 1.3907542192366906e-07,
+              "second_D": 1.384990647213581e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true,
+            "baseline_bitwise_equal": true,
+            "compared_tensor_equal_by_rank": [
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            ]
+          },
+          "head_g2_RD_lifetime": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              524288,
+              524288,
+              786432,
+              786432
+            ],
+            "cache_sum_bytes": 2621440,
+            "cache_max_bytes": 786432,
+            "max_relative_l2": {
+              "H": 1.3815111261365336e-07,
+              "D": 1.3974490714784065e-07,
+              "second_H": 1.3907542192366906e-07,
+              "second_D": 1.384990647213581e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true,
+            "baseline_bitwise_equal": true,
+            "compared_tensor_equal_by_rank": [
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            ]
+          },
+          "head_g2_RD_direct": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              524288,
+              524288,
+              786432,
+              786432
+            ],
+            "cache_sum_bytes": 2621440,
+            "cache_max_bytes": 786432,
+            "max_relative_l2": {
+              "H": 1.3815111261365336e-07,
+              "D": 1.3974490714784065e-07,
+              "second_H": 1.3907542192366906e-07,
+              "second_D": 1.384990647213581e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true,
+            "baseline_bitwise_equal": true,
+            "compared_tensor_equal_by_rank": [
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            ]
+          }
+        }
+      }
+    },
+    {
+      "label": "g2_cp8_b1",
+      "world_size": 8,
+      "input_shape": [
+        1,
+        4,
+        128,
+        128
+      ],
+      "config": {
+        "device": "cpu",
+        "variants": [
+          "baseline",
+          "lifetime",
+          "direct"
+        ],
+        "protocols": [
+          "flat",
+          "head",
+          "tree"
+        ],
+        "group_width": 2,
+        "heads": 4,
+        "batch": 1,
+        "seed": 20261029,
+        "source_ranks": 8,
+        "repeat_captures": false,
+        "force_public": false,
+        "warmup": 0,
+        "iterations": 1,
+        "cases": "both",
+        "profile_only": false,
+        "suite": "g2",
+        "input_kind": "synthetic",
+        "profiles_requested": false
+      },
+      "pass": true,
+      "sources_at_run": {
+        "hyper_parallel.distributed.context_parallel.kimi_delta_attention_rd": {
+          "sha256": "b8b1fa04fe5e95fd2a0feb263fbf195b3475c221a5ce4b788e959797af9dd257"
+        },
+        "hyper_parallel.distributed.context_parallel.kimi_delta_attention_rd_plan": {
+          "sha256": "da00615e4384e35f7a3749e19e9663f9c9b165168bbbb3a1cfb841b2d77a0c64"
+        },
+        "research.rd_publish_20261030.archive_staging.cached_tree": {
+          "sha256": "21215c9450dec0ee5c34f92ddc32d865b4759a75b89c025d2a80a8c11753769b"
+        },
+        "research.rd_publish_20261030.archive_staging.head_owner_rd": {
+          "sha256": "0e49791975182f942f7c9f7666eb386106cea232b3b22546b6db789445e41ace"
+        },
+        "research.rd_publish_20261030.archive_staging.head_rd_lifetime": {
+          "sha256": "afef1a244be459a67cd64805e1ab6d1a5662a7b8738bab6f24bc1b0e1af44f47"
+        },
+        "research.rd_publish_20261030.archive_staging.protocol_sources": {
+          "sha256": "4e5410504a28ba068936f7146399774fac20fb17c3a4d75b14a06a77c60e303e"
+        }
+      },
+      "worker_sha256": "98e299c3804bf2db93b057da4429f78bec8af1b988400fb8a5401aa5a4c74959",
+      "benchmark_sha256": "8faa2aeb7f72d830066450c954ee1f5b305c4019b54aa0d2927bfec77a6454bb",
+      "cases": {
+        "long": {
+          "head_g2_RD_baseline": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              262144,
+              262144,
+              393216,
+              393216,
+              524288,
+              524288,
+              524288,
+              524288
+            ],
+            "cache_sum_bytes": 3407872,
+            "cache_max_bytes": 524288,
+            "max_relative_l2": {
+              "H": 2.9247583795028777e-07,
+              "D": 2.953664619841533e-07,
+              "second_H": 2.938660926486899e-07,
+              "second_D": 2.956359976347312e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true,
+            "baseline_bitwise_equal": true,
+            "compared_tensor_equal_by_rank": [
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            ]
+          },
+          "head_g2_RD_lifetime": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              262144,
+              262144,
+              393216,
+              393216,
+              524288,
+              524288,
+              524288,
+              524288
+            ],
+            "cache_sum_bytes": 3407872,
+            "cache_max_bytes": 524288,
+            "max_relative_l2": {
+              "H": 2.9247583795028777e-07,
+              "D": 2.953664619841533e-07,
+              "second_H": 2.938660926486899e-07,
+              "second_D": 2.956359976347312e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true,
+            "baseline_bitwise_equal": true,
+            "compared_tensor_equal_by_rank": [
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            ]
+          },
+          "head_g2_RD_direct": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              262144,
+              262144,
+              393216,
+              393216,
+              524288,
+              524288,
+              524288,
+              524288
+            ],
+            "cache_sum_bytes": 3407872,
+            "cache_max_bytes": 524288,
+            "max_relative_l2": {
+              "H": 2.9247583795028777e-07,
+              "D": 2.953664619841533e-07,
+              "second_H": 2.938660926486899e-07,
+              "second_D": 2.956359976347312e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true,
+            "baseline_bitwise_equal": true,
+            "compared_tensor_equal_by_rank": [
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            ]
+          }
+        },
+        "reset": {
+          "head_g2_RD_baseline": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              262144,
+              262144,
+              393216,
+              393216,
+              524288,
+              524288,
+              524288,
+              524288
+            ],
+            "cache_sum_bytes": 3407872,
+            "cache_max_bytes": 524288,
+            "max_relative_l2": {
+              "H": 1.4114253365213356e-07,
+              "D": 1.4059175607842748e-07,
+              "second_H": 1.3981103608244614e-07,
+              "second_D": 1.399623062111274e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true,
+            "baseline_bitwise_equal": true,
+            "compared_tensor_equal_by_rank": [
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            ]
+          },
+          "head_g2_RD_lifetime": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              262144,
+              262144,
+              393216,
+              393216,
+              524288,
+              524288,
+              524288,
+              524288
+            ],
+            "cache_sum_bytes": 3407872,
+            "cache_max_bytes": 524288,
+            "max_relative_l2": {
+              "H": 1.4114253365213356e-07,
+              "D": 1.4059175607842748e-07,
+              "second_H": 1.3981103608244614e-07,
+              "second_D": 1.399623062111274e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true,
+            "baseline_bitwise_equal": true,
+            "compared_tensor_equal_by_rank": [
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            ]
+          },
+          "head_g2_RD_direct": {
+            "pass": true,
+            "cache_bytes_by_rank": [
+              262144,
+              262144,
+              393216,
+              393216,
+              524288,
+              524288,
+              524288,
+              524288
+            ],
+            "cache_sum_bytes": 3407872,
+            "cache_max_bytes": 524288,
+            "max_relative_l2": {
+              "H": 1.4114253365213356e-07,
+              "D": 1.4059175607842748e-07,
+              "second_H": 1.3981103608244614e-07,
+              "second_D": 1.399623062111274e-07
+            },
+            "max_vs_first_relative_l2": {
+              "H": 0.0,
+              "D": 0.0,
+              "second_H": 0.0,
+              "second_D": 0.0
+            },
+            "all_ranks_invariant": {
+              "inputs_immutable": true,
+              "cache_immutable": true,
+              "second_inputs_immutable": true,
+              "second_cache_immutable": true
+            },
+            "all_ranks_cache_compact": true,
+            "baseline_bitwise_equal": true,
+            "compared_tensor_equal_by_rank": [
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

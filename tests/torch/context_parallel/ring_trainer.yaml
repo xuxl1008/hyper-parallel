@@ -1,0 +1,88 @@
+# Offline system-test recipe: complete 256-token samples, no padding or packing.
+model:
+  _target_: tests.torch.context_parallel.ring_trainer_factories.build_model
+model_init_dtype: bfloat16
+
+training:
+  train_iters: 3
+  global_batch_size: 2
+  micro_batch_size: 1
+  backend: hccl
+  seed: 314159
+  enable_full_determinism: true
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+
+accelerator:
+  cp_size: 8
+
+fsdp_config:
+  dp_shard_size: 8
+  edp_shard_size: 8
+  reshard_after_forward: true
+  reshard_after_backward: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    # Preserve the model's FP32 scalar loss instead of narrowing every output.
+    output_dtype: null
+
+plan_overrides:
+  - match: "*.self_attn"
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_flash_attention
+  - match: "*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel_ring.qwen3_moe_ring_cp_wrapper
+        ulysses_degree: 2
+        overlap: true
+        load_balance: zigzag
+
+activation_checkpoint:
+  mode: full
+
+dataset:
+  _target_: tests.torch.context_parallel.ring_trainer_factories.build_dataset
+  data_config:
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_default_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: indexed
+  drop_last: true
+  num_workers: 0
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
+  adamw_config:
+    adamw_lr: 0.0001
+    adamw_weight_decay: 0.0
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 0.0001
+    lr_warmup_steps: 0
+    min_lr: 0.0001
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./outputs/ring_trainer/checkpoints
+
+debug:
+  check_fsdp_runtime: true

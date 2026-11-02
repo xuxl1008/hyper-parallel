@@ -16,6 +16,7 @@
 | [TP 张量并行](./guide/tensor_parallel.md) | ColwiseParallel、RowwiseParallel、parallelize_module、Loss Parallel |
 | [PP 流水线并行](./guide/pipeline_parallel.md) | PipelineStage、Schedule、overlap_b_f、PP+FSDP、P2P prefetch、 Mpipe |
 | [CP 上下文并行](./guide/context_parallel.md) | ContextParallel、AsyncContextParallel、DSA 系列 |
+| [Ring Attention 实现与实验记录](./guide/ring_attention.md) | Ring、packed TND、负载均衡、通算重叠、数据采样与性能记录 |
 | [KDA 上下文并行](./guide/kda_context_parallel.md) | KDA P2P、AllGather、Ulysses 及混合方式的配置与显存 |
 | [线性注意力 TND 上下文并行](./guide/linear_attention_tnd_cp.md) | KDA / GDN 的文档边界、配置、状态交换与数值语义 |
 | [EP 专家并行](./guide/expert_parallel.md) | ExpertParallel、MoE 构建模块、负载均衡 |

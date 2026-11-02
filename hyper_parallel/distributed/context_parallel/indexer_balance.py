@@ -25,12 +25,15 @@ from bisect import bisect_right
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import lru_cache
-from heapq import heapify, heappop, heappush
 from itertools import accumulate
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+
+from hyper_parallel.distributed.context_parallel.query_balance import (
+    QueryTask as IndexerTask, _receive_ranges, _send_ranges, query_task_plan, query_route_from_ranges,
+)
 
 
 def resolve_indexer_balance_block_size(mode: str, block_size: int | None) -> int | None:
@@ -38,6 +41,13 @@ def resolve_indexer_balance_block_size(mode: str, block_size: int | None) -> int
 
     None represents an omitted option so none/zigzag remain valid without it.
     Explicit values require greedy/hybrid mode and must be positive integers.
+
+    Args:
+        mode: Selected Indexer load-balancing strategy.
+        block_size: Optional positive query block size for greedy/hybrid.
+
+    Returns:
+        Resolved block size, or None when the selected strategy does not use it.
     """
     if mode not in ("none", "zigzag", "greedy", "hybrid"):
         raise ValueError("indexer_load_balance must be 'none', 'zigzag', 'greedy' or 'hybrid'")
@@ -66,123 +76,6 @@ def validate_indexer_hybrid_threshold(mode: str, min_length: int | None) -> None
         raise ValueError(
             "indexer_load_balance='hybrid' requires an explicit positive integer indexer_zigzag_min_length"
         )
-
-
-@dataclass(frozen=True, order=True)
-class IndexerTask:
-    """A contiguous query interval in the original document coordinates."""
-
-    document: int
-    start: int
-    end: int
-
-    @property
-    def length(self) -> int:
-        """Return the number of real query rows, excluding any synthetic padding."""
-        return self.end - self.start
-
-
-def _merge_tasks(tasks: list[IndexerTask]) -> tuple[IndexerTask, ...]:
-    merged = []
-    for task in sorted(tasks):
-        if merged and merged[-1].document == task.document and merged[-1].end == task.start:
-            merged[-1] = IndexerTask(task.document, merged[-1].start, task.end)
-        elif task.length:
-            merged.append(task)
-    return tuple(merged)
-
-
-def _work_prefix(length: int, ratio: int) -> int:
-    groups, tail = divmod(length, ratio)
-    return ratio * groups * (groups - 1) // 2 + groups * (tail + 1)
-
-
-def _task_work(task: IndexerTask, ratio: int) -> int:
-    return _work_prefix(task.end, ratio) - _work_prefix(task.start, ratio)
-
-
-def _zigzag_tasks(lengths: tuple[int, ...], size: int) -> list[list[IndexerTask]]:
-    """Assign paired document chunks and evenly distribute their leading remainders."""
-    assignments = [[] for _ in range(size)]
-    remainders = []
-    for document, length in enumerate(lengths):
-        chunk, remainder = divmod(length, 2 * size)
-        if remainder:
-            remainders.append(IndexerTask(document, 0, remainder))
-        if chunk:
-            for rank in range(size):
-                for slot in (rank, 2 * size - 1 - rank):
-                    start = remainder + slot * chunk
-                    assignments[rank].append(IndexerTask(document, start, start + chunk))
-    # All ranks already own equally many paired rows. Distribute the real
-    # remainder rows evenly without inserting tokens into any document.
-    capacity = sum(task.length for task in remainders) // size
-    rank, used = 0, 0
-    for task in remainders:
-        start = task.start
-        while start < task.end:
-            if used == capacity:
-                rank += 1
-                used = 0
-            end = min(task.end, start + capacity - used)
-            assignments[rank].append(IndexerTask(task.document, start, end))
-            used += end - start
-            start = end
-    return assignments
-
-
-def _greedy_tasks(lengths: tuple[int, ...], size: int, ratio: int, block: int) -> list[list[IndexerTask]]:
-    """Keep the original cost/count/rank ordering without scanning every rank."""
-    tasks = [IndexerTask(document, start, min(start + block, length))
-             for document, length in enumerate(lengths) for start in range(0, length, block)]
-    assignments = [[] for _ in range(size)]
-    _assign_greedy_tasks(assignments, tasks, ratio, 2 * (sum(lengths) // size))
-    return assignments
-
-
-def _assign_greedy_tasks(assignments: list[list[IndexerTask]], tasks: list[IndexerTask],
-                          ratio: int, capacity: int) -> None:
-    """Add pooled tasks to the existing per-worker cost and row budgets."""
-    available = [(sum(_task_work(task, ratio) for task in assigned), sum(task.length for task in assigned), rank)
-                 for rank, assigned in enumerate(assignments)]
-    heapify(available)
-    # Reuse the cost computed for sorting when updating the selected worker.
-    for negative_work, task in sorted((-_task_work(task, ratio), task) for task in tasks):
-        skipped = []
-        for _ in range(len(available)):
-            cost, count, rank = heappop(available)
-            if count + task.length <= capacity:
-                break
-            skipped.append((cost, count, rank))
-        else:
-            raise ValueError(f"No Indexer worker has capacity for {task.length} query rows (limit: {capacity})")
-        assignments[rank].append(task)
-        heappush(available, (cost - negative_work, count + task.length, rank))
-        for item in skipped:
-            heappush(available, item)
-
-
-def _hybrid_tasks(lengths: tuple[int, ...], size: int, ratio: int, block: int,
-                   min_length: int) -> list[list[IndexerTask]]:
-    """Keep eligible zigzag pairs intact and greedily allocate every remaining row.
-
-    Documents shorter than 2*size contain no complete pair and enter the greedy pool.
-    """
-    assignments, pooled = [[] for _ in range(size)], []
-    for document, length in enumerate(lengths):
-        chunk, remainder = divmod(length, 2 * size)
-        if length >= min_length and chunk:
-            for rank in range(size):
-                for slot in (rank, 2 * size - 1 - rank):
-                    start = remainder + slot * chunk
-                    assignments[rank].append(IndexerTask(document, start, start + chunk))
-            pool_end = remainder
-        else:
-            pool_end = length
-        pooled.extend(IndexerTask(document, start, min(start + block, pool_end))
-                      for start in range(0, pool_end, block))
-    _assign_greedy_tasks(assignments, pooled, ratio, 2 * (sum(lengths) // size))
-    return assignments
 
 
 def _validate_task_plan(lengths: tuple[int, ...], size: int, ratio: int, mode: str,
@@ -227,13 +120,10 @@ def indexer_task_plan(lengths: tuple[int, ...], size: int, ratio: int, mode: str
     """
     block = _validate_task_plan(lengths, size, ratio, mode, block_size)
     validate_indexer_hybrid_threshold(mode, zigzag_min_length)
-    if mode == "zigzag":
-        assignments = _zigzag_tasks(lengths, size)
-    elif mode == "hybrid":
-        assignments = _hybrid_tasks(lengths, size, ratio, block, zigzag_min_length)
-    else:
-        assignments = _greedy_tasks(lengths, size, ratio, block)
-    return tuple(_merge_tasks(tasks) for tasks in assignments)
+    return query_task_plan(
+        lengths, size, mode, compression_ratio=ratio, block_size=block,
+        zigzag_min_length=zigzag_min_length,
+    )
 
 
 def _segments(tasks: tuple, lengths: tuple[int, ...], ratio: int) -> tuple:
@@ -244,33 +134,6 @@ def _segments(tasks: tuple, lengths: tuple[int, ...], ratio: int) -> tuple:
         result.append((cursor, cursor + task.length, base, base + task.end // ratio, task.end % ratio))
         cursor += task.length
     return tuple(result)
-
-
-def _send_ranges(tasks: tuple, boundaries: tuple[int, ...], owner: int, local: int) -> tuple:
-    """Find only tasks intersecting this owner in each sorted worker assignment."""
-    first, last = owner * local, (owner + 1) * local
-    start = bisect_right(tasks, first, key=lambda task: boundaries[task.document] + task.end)
-    result = []
-    for index in range(start, len(tasks)):
-        task = tasks[index]
-        begin, end = boundaries[task.document] + task.start, boundaries[task.document] + task.end
-        if begin >= last:
-            break
-        begin, end = max(first, begin), min(last, end)
-        result.append((begin - first, end - begin))
-    return tuple(result)
-
-
-def _receive_ranges(tasks: tuple, boundaries: tuple[int, ...], size: int, local: int) -> tuple:
-    """Index a worker's tasks by owner once, retaining its original packed offsets."""
-    owners, cursor = [[] for _ in range(size)], 0
-    for task in tasks:
-        begin, end = boundaries[task.document] + task.start, boundaries[task.document] + task.end
-        for owner in range(begin // local, (end - 1) // local + 1):
-            first, last = max(begin, owner * local), min(end, (owner + 1) * local)
-            owners[owner].append((first - owner * local, cursor + first - begin, last - first))
-        cursor += task.length
-    return tuple(tuple(rows) for rows in owners)
 
 
 def _append_ordered_task(tasks: list[IndexerTask], document: int, start: int, end: int) -> None:
@@ -392,19 +255,8 @@ def _route_from_tasks(assignments: tuple, lengths: tuple[int, ...], rank: int, r
 def _route_from_ranges(tasks: tuple, lengths: tuple[int, ...], rank: int, ratio: int,
                        sends: tuple, receives: tuple) -> IndexerRoute:
     """Preserve peer ordering and local bypass for either task-planning path."""
-    send_rows, receive_rows, inputs, outputs = [], [], [], []
-    for peer, sent in enumerate(sends):
-        sent = sent if peer != rank else ()
-        received = receives[peer] if peer != rank else ()
-        inputs.append(sum(count for _, count in sent))
-        outputs.append(sum(count for _, _, count in received))
-        send_rows.extend(row for start, count in sent for row in range(start, start + count))
-        receive_rows.extend(row for _, start, count in received for row in range(start, start + count))
-    sources = tuple(row for start, _, count in receives[rank] for row in range(start, start + count))
-    targets = tuple(row for _, start, count in receives[rank] for row in range(start, start + count))
-    return IndexerRoute(_segments(tasks, lengths, ratio), tuple(inputs), tuple(outputs),
-                        tuple(send_rows), tuple(receive_rows), sources, targets,
-                        sum(task.length for task in tasks))
+    route = query_route_from_ranges(tasks, rank, sends, receives)
+    return IndexerRoute(_segments(tasks, lengths, ratio), **vars(route))
 
 
 @lru_cache(maxsize=32)
@@ -543,7 +395,14 @@ class IndexerInputExchange:
 
     @torch.no_grad()
     def launch_result(self, selected: torch.Tensor) -> _PendingRows:
-        """Return selection IDs while owner-side differentiable projections run."""
+        """Return selection IDs while owner-side differentiable projections run.
+
+        Args:
+            selected: Selected key IDs in worker query order.
+
+        Returns:
+            Pending transfer that restores selection IDs to their query owners.
+        """
         send_rows, receive_rows, local_sources, local_targets = self.rows
         send = selected.index_select(0, receive_rows).contiguous()
         received = selected.new_empty((sum(self.route.input_splits), selected.shape[-1]))

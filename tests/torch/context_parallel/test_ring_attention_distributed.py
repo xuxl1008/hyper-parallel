@@ -1,0 +1,44 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Lightweight launchers for real HCCL Ring Attention forward/backward."""
+
+from pathlib import Path
+
+from tests.common.distributed_launcher import torchrun_case
+from tests.common.mark_utils import arg_mark
+
+_WORKER = str(Path(__file__).with_name("_test_ring_attention_distributed.py"))
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_ring_attention_2_cards() -> None:
+    """
+    Feature: Two-card Ring Attention with explicit gradient return.
+    Description: Compare outputs and gradients, exercise owner-only losses and repeated buffer reuse.
+    Expectation: Native-reference parity, unchanged inputs and bounded live memory.
+    """
+    torchrun_case(_WORKER, "TestRingAttention", num_proc=2)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_ring_attention_4_cards() -> None:
+    """
+    Feature: Four-card Ring Attention and noncontiguous two-card CP subgroups.
+    Description: Exercise a complete four-rank KV/gradient cycle and group-to-global peer mapping.
+    Expectation: Each owner receives the sum of every consumer's dKV contributions.
+    """
+    torchrun_case(_WORKER, "TestRingAttention", num_proc=4)

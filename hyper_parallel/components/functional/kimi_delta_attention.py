@@ -240,6 +240,7 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         cp_size: int,
         state_cp: Any,
         sequence_info: Optional[PackedSequenceInfo],
+        p2p_transport: Any,
     ) -> torch.Tensor:
         """Prepare local KDA, propagate its state, and produce token outputs.
 
@@ -296,7 +297,11 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         send_next = cp_rank < cp_size - 1 and (sequence_info is None or sequence_info.continues_next)
         initial_state = None
         recv_handle = None
-        if state_cp is None and receive_previous:
+        exchange = None
+        if p2p_transport is not None:
+            ctx.p2p_lease = p2p_transport.arena.retain_autograd()
+            exchange = p2p_transport.arena.begin(0, receive_previous, send_next)
+        if exchange is None and state_cp is None and receive_previous:
             initial_state = torch.empty(state_shape, device=query.device, dtype=torch.float32)
             recv_handle = dist.irecv(initial_state, src=prev_rank, group=cp_group)
 
@@ -309,7 +314,10 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         del _
         state_ext = None
         transition = None
-        if sequence_info is not None:
+        if exchange is not None:
+            state_ext, transition = p2p_transport.prepare_forward(
+                kg, w, u, gate, sequence_info, chunk_size, exchange)
+        elif sequence_info is not None:
             state_ext, transition = _prepare_packed_kda_summary(
                 kg, w, u, gate, sequence_info, state_cp, send_next, chunk_size,
             )
@@ -330,7 +338,9 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         send_handle = None
         send_state = None
         state_cache = (transition,) if transition is not None else ()
-        if state_cp is not None:
+        if exchange is not None:
+            initial_state = exchange.wait_input()
+        elif state_cp is not None:
             initial_state, state_cache = state_cp.forward(state_ext, transition)
             transition = None
         elif send_next:
@@ -356,6 +366,9 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         if send_handle is not None:
             send_handle.wait()
 
+        if exchange is not None:
+            exchange.finish()
+
         saved_initial_state = initial_state
         if saved_initial_state is None:
             saved_initial_state = query.new_empty(0, dtype=torch.float32)
@@ -375,6 +388,7 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
         ctx.state_cp = state_cp
+        ctx.p2p_transport = p2p_transport
         ctx.state_cache_count = len(state_cache)
         ctx.receive_previous = receive_previous
         ctx.send_next = send_next
@@ -418,7 +432,11 @@ class _KDAStateP2PFunction(torch.autograd.Function):
 
         grad_final_state = None
         recv_handle = None
-        if ctx.state_cp is None and ctx.send_next:
+        exchange = None
+        if ctx.p2p_transport is not None:
+            ctx.p2p_lease.check()
+            exchange = ctx.p2p_transport.arena.begin(1, ctx.send_next, ctx.receive_previous)
+        if exchange is None and ctx.state_cp is None and ctx.send_next:
             grad_final_state = torch.empty(
                 (query.shape[0], value.shape[2], query.shape[-1], value.shape[-1]), device=query.device,
                 dtype=torch.float32,
@@ -446,7 +464,11 @@ class _KDAStateP2PFunction(torch.autograd.Function):
             **varlen,
         )
         grad_state_ext = None
-        if ctx.state_cp is not None or ctx.receive_previous:
+        if exchange is not None:
+            grad_state_ext = ctx.p2p_transport.prepare_backward(
+                query_gated, key_gated, w, gate, grad_output, grad_value_local, ctx.scale,
+                ctx.chunk_size, sequence_info, state_cache[0] if state_cache else None, exchange)
+        elif ctx.state_cp is not None or ctx.receive_previous:
             if sequence_info is not None and not sequence_info.continues_previous:
                 if not getattr(ctx.state_cp, "allows_absent_summaries", False):
                     grad_state_ext = query.new_zeros(
@@ -462,7 +484,9 @@ class _KDAStateP2PFunction(torch.autograd.Function):
             recv_handle = None
         send_handle = None
         send_state_gradient = None
-        if ctx.state_cp is not None:
+        if exchange is not None:
+            grad_final_state = exchange.wait_input()
+        elif ctx.state_cp is not None:
             grad_final_state = ctx.state_cp.backward(grad_state_ext, state_cache)
         elif ctx.receive_previous:
             transition = state_cache[0] if state_cache else None
@@ -516,9 +540,13 @@ class _KDAStateP2PFunction(torch.autograd.Function):
         if send_handle is not None:
             send_handle.wait()
 
+        if exchange is not None:
+            exchange.finish()
+            ctx.p2p_lease.complete()
+
         return (
             grad_query, grad_key, grad_value, grad_gate, grad_beta, grad_a_log, grad_dt_bias, None, None, None,
-            None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
         )
 
 
@@ -543,6 +571,7 @@ def fused_chunk_kda_p2p(
     safe_gate: bool = True,
     state_cp: Any = None,
     sequence_info: Optional[PackedSequenceInfo] = None,
+    p2p_transport: Any = None,
 ) -> torch.Tensor:
     """Run one sequence-sharded KDA segment with a selected state CP executor.
 
@@ -567,6 +596,7 @@ def fused_chunk_kda_p2p(
         chunk_size: Tokens per local chunk.
         safe_gate: Enable the staged safe-gate path.
         state_cp: State executor returning an invocation cache; None selects existing P2P.
+        p2p_transport: Optional explicitly owned KDA one-sided transport; requires state_cp=None.
 
     Returns:
         Output tokens in the local sequence layout.
@@ -589,6 +619,12 @@ def fused_chunk_kda_p2p(
             raise ValueError("Packed state CP requires batch dimension one.")
         resolve_packed_sequence({"packed_sequence_info": sequence_info}, query.shape[1],
                                 cp_rank=cp_rank, cp_size=cp_size)
+    if p2p_transport is not None:
+        if state_cp is not None:
+            raise ValueError("A one-sided P2P transport cannot be combined with an AG/RD state executor.")
+        p2p_transport.validate(cp_group, query, value, chunk_size)
+        if (cp_rank, cp_size) != (p2p_transport.arena.rank, p2p_transport.arena.size):
+            raise ValueError("KDA rank metadata differs from the state transport group.")
     effective_scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
     return _KDAStateP2PFunction.apply(
         query,
@@ -609,4 +645,5 @@ def fused_chunk_kda_p2p(
         cp_size,
         state_cp,
         sequence_info,
+        p2p_transport,
     )

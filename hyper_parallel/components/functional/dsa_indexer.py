@@ -14,6 +14,9 @@
 # ============================================================================
 """DSA sparse-attention indexer."""
 
+from __future__ import annotations
+
+from functools import lru_cache
 from typing import Tuple
 
 import torch
@@ -24,6 +27,26 @@ from hyper_parallel.tools.logging import get_logger
 logger = get_logger()
 
 
+@lru_cache(maxsize=128)
+@torch.inference_mode(False)
+def _planned_metadata(query_ends, key_ends, device, stream, heads, key_heads, dim, topk):
+    """Reuse tiling for an immutable host document plan on its creating stream."""
+    del stream
+    # Only the selected native path needs the optional extension.
+    from cann_ops_transformer import lightning_indexer_metadata  # pylint: disable=import-outside-toplevel
+
+    cu_q = torch.tensor((0, *query_ends), device=device, dtype=torch.int32)
+    cu_k = torch.tensor((0, *key_ends), device=device, dtype=torch.int32)
+    metadata = lightning_indexer_metadata(
+        heads, key_heads, dim, topk, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+        batch_size=len(query_ends),
+        max_seqlen_q=max(end-start for start, end in zip((0, *query_ends[:-1]), query_ends)),
+        max_seqlen_k=max(end-start for start, end in zip((0, *key_ends[:-1]), key_ends)),
+        layout_q="TND", layout_k="TND", mask_mode=3, cmp_ratio=1,
+    )
+    return cu_q, cu_k, metadata
+
+
 def _cann_lightning_indexer(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -31,32 +54,38 @@ def _cann_lightning_indexer(
     actual_seq_qlen: torch.Tensor,
     actual_seq_klen: torch.Tensor,
     sparse_count: int,
+    host_lengths: tuple | None = None,
 ) -> torch.Tensor:
     """Call the ops-transformer LightningIndexer V2 with TND metadata."""
-    cu_q = torch.cat((actual_seq_qlen.new_zeros(1), actual_seq_qlen))
-    cu_k = torch.cat((actual_seq_klen.new_zeros(1), actual_seq_klen))
-    kwargs = {
-        "cu_seqlens_q": cu_q,
-        "cu_seqlens_k": cu_k,
-        "layout_q": "TND",
-        "layout_k": "TND",
-        "mask_mode": 3,
-        "cmp_ratio": 1,
-        "return_value": 0,
-    }
     # The package is optional and is needed only for this selected CANN path.
-    from cann_ops_transformer.ops import (  # pylint: disable=import-outside-toplevel
-        lightning_indexer,
-        lightning_indexer_metadata,
+    from cann_ops_transformer import (  # pylint: disable=import-outside-toplevel
+        lightning_indexer, lightning_indexer_metadata,
     )
 
-    kwargs["metadata"] = lightning_indexer_metadata(
-        query.shape[-2], key.shape[-2], query.shape[-1], sparse_count,
-        cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, batch_size=cu_q.numel() - 1,
-        max_seqlen_q=int((cu_q[1:] - cu_q[:-1]).max().item()),
-        max_seqlen_k=int((cu_k[1:] - cu_k[:-1]).max().item()),
-        layout_q="TND", layout_k="TND", mask_mode=3, cmp_ratio=1,
-    )
+    if host_lengths is None:
+        cu_q = torch.cat((actual_seq_qlen.new_zeros(1), actual_seq_qlen))
+        cu_k = torch.cat((actual_seq_klen.new_zeros(1), actual_seq_klen))
+        metadata = lightning_indexer_metadata(
+            query.shape[-2], key.shape[-2], query.shape[-1], sparse_count,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, batch_size=cu_q.numel() - 1,
+            max_seqlen_q=int((cu_q[1:] - cu_q[:-1]).max().item()),
+            max_seqlen_k=int((cu_k[1:] - cu_k[:-1]).max().item()),
+            layout_q="TND", layout_k="TND", mask_mode=3, cmp_ratio=1,
+        )
+    else:
+        query_ends, key_ends = (tuple(ends) for ends in host_lengths)
+        if (not query_ends or len(query_ends) != len(key_ends)
+                or query_ends[-1] != query.shape[0] or key_ends[-1] != key.shape[0]
+                or any(end <= start for ends in (query_ends, key_ends)
+                       for start, end in zip((0, *ends[:-1]), ends))):
+            raise ValueError("DSA host lengths must be positive paired cumulative ends covering Q and K")
+        stream = (None if query.device.type == "cpu" else
+                  torch.get_device_module(query.device).current_stream(query.device))
+        cu_q, cu_k, metadata = _planned_metadata(
+            query_ends, key_ends, query.device, stream, query.shape[-2], key.shape[-2], query.shape[-1], sparse_count,
+        )
+    kwargs = {"cu_seqlens_q": cu_q, "cu_seqlens_k": cu_k, "metadata": metadata,
+              "layout_q": "TND", "layout_k": "TND", "mask_mode": 3, "cmp_ratio": 1, "return_value": 0}
     indices, _ = lightning_indexer(
         query.contiguous(), key.contiguous(), weights.float().contiguous(), sparse_count, **kwargs,
     )
@@ -72,6 +101,7 @@ def dsa_indexer(
     sparse_count: int,
     *,
     backend: str = "cann",
+    host_lengths: tuple | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate top-k token indices for DSA sparse attention.
 
@@ -83,6 +113,8 @@ def dsa_indexer(
         actual_seq_kvlen: Cumulative key lengths as an int32 NPU tensor.
         sparse_count: Number of token indices selected for each query.
         backend: ``"cann"`` (default) or the legacy ``"omni"`` backend.
+        host_lengths: Optional matching host Q/K cumulative ends. CP passes its
+            immutable document plan to cache metadata without device reductions.
 
     Returns:
         Top-k indices in ``[T, N_kv, K]`` int32 layout, followed by the query,
@@ -105,6 +137,7 @@ def dsa_indexer(
             actual_seq_qlen,
             actual_seq_kvlen,
             sparse_count,
+            host_lengths,
         )
     else:
         logger.warning(

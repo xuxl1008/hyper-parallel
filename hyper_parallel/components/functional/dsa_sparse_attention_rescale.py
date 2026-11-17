@@ -20,7 +20,6 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from einops import rearrange
-import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
 
 
 def _sparse_attention_forward(
@@ -28,6 +27,9 @@ def _sparse_attention_forward(
     batch_size, sequence_length, scale, actual_seq_qlen, actual_seq_kvlen,
 ):
     """Run sparse attention and restore the padded output's BSND layout."""
+    # Register legacy custom operators only when this optional path executes.
+    import omni_training_custom_ops  # noqa: F401  # pylint: disable=import-outside-toplevel,unused-import
+
     query_nope, compressed_kv, query_rope, key_rope = [
         rearrange(tensor, "b s n d -> (b s) n d")
         for tensor in (query_nope, compressed_kv, query_rope, key_rope)

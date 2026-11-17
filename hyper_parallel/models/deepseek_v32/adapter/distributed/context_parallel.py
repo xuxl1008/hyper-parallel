@@ -14,11 +14,11 @@
 # ============================================================================
 """DeepSeek-V3.2 DSA Context Parallel wrappers.
 
-The DeepSeek DSA replacement keeps the query shard local, while indexer keys
-and compressed MLA keys are gathered from the CP peers.  Every rank only
-consumes the causal prefix ending at its local query shard.  The wrapper owns
-that communication and length conversion; the high-performance DSA operators
-remain in :mod:`hyper_parallel.components.functional`.
+Main attention and KL retain the query shard while optional sparse selection
+workers exchange low-rank qr and integer TopK. Main and Index K banks use either
+all-gather or document-prefix all-to-all-v; the Index K route includes both
+worker selection and owner KL needs. Dense warmup retains the owner layout.
+The high-performance DSA operators remain in components.functional.
 """
 # This model-specific adapter orchestrates PyTorch/NPU tensors directly.
 
@@ -26,12 +26,15 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from functools import wraps
+from itertools import accumulate
 from typing import Any
 
 import torch
 from torch import nn
 
-from hyper_parallel.components.functional import dsa_indexer, dsa_sparse_attention
+from hyper_parallel.components.functional.dsa_indexer import dsa_indexer
+from hyper_parallel.components.functional.dsa_sparse_attention import dsa_sparse_attention
+from hyper_parallel.components.functional.rotary_embedding import _apply_interleaved_rope
 from hyper_parallel.components.functional.npu_fusion_attention import (
     resolve_packed_sequence_lengths,
 )
@@ -46,131 +49,131 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
 from hyper_parallel.distributed.context_parallel.collectives import (
     async_cp_allgather_launch,
 )
+from hyper_parallel.distributed.context_parallel.indexer_balance import (
+    launch_indexer_inputs, resolve_indexer_balance_block_size, validate_indexer_hybrid_threshold,
+)
+from hyper_parallel.distributed.context_parallel.index_key_dispatch import index_key_plan
+from hyper_parallel.distributed.context_parallel.sequence_dispatch import (
+    async_sequence_dispatch, document_prefix_route,
+)
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
+from hyper_parallel.models.deepseek_v32.adapter.distributed.document_plan import (
+    dsa_document_plan, pack_selection_prefixes,
+)
 
 
-def _intersection_length(
-    start: int,
-    end: int,
-    window_start: int,
-    window_end: int,
-) -> int:
-    """Return the number of tokens shared by two half-open intervals."""
-    return max(min(end, window_end) - max(start, window_start), 0)
-
-
-def _cp_local_sequence_lengths(
-    boundaries: Sequence[int],
-    *,
-    batch_size: int,
-    local_seq_len: int,
-    cp_size: int,
-    cp_rank: int,
-    kind: str,
-) -> torch.Tensor:
-    """Convert global packed boundaries to this rank's Q/KV cumulative ends.
-
-    ``boundaries`` describe the unsharded ``[B, S_global]`` token stream.  A
-    query shard covers ``[offset, offset + local_seq_len)`` in each row, while
-    the gathered KV tensor covers the causal prefix ``[0, prefix_len)``.  The
-    Dense DSA requires every packed sequence to contribute query tokens on each
-    CP rank, so its cumulative query lengths remain strictly increasing.
-    """
-    global_seq_len = local_seq_len * cp_size
-    prefix_len = (cp_rank + 1) * local_seq_len
-    offset = cp_rank * local_seq_len
-    global_tokens = batch_size * global_seq_len
-    previous = 0
-    cumulative: list[int] = []
-    total = 0
-
-    for raw_end in boundaries:
-        end = int(raw_end)
-        if end <= previous or end > global_tokens:
-            raise ValueError(
-                f"global {kind} sequence boundaries must be strictly increasing "
-                f"within [1, {global_tokens}], got {end} after {previous}"
-            )
-        start = previous
-        previous = end
-        first_row = start // global_seq_len
-        last_row = (end - 1) // global_seq_len
-        length = 0
-        for row in range(first_row, last_row + 1):
-            row_base = row * global_seq_len
-            if kind == "query":
-                window_start = row_base + offset
-                window_end = window_start + local_seq_len
-            else:
-                window_start = row_base
-                window_end = row_base + prefix_len
-            length += _intersection_length(start, end, window_start, window_end)
-        total += length
-        cumulative.append(total)
-
-    expected_total = (
-        batch_size * local_seq_len
-        if kind == "query"
-        else batch_size * prefix_len
+def _resolve_cp_document_plan(actual_seq_len, kwargs, batch_size, local_seq_len, cp_size, cp_rank):
+    """Resolve packed aliases once and omit documents without local queries."""
+    total = batch_size * local_seq_len * cp_size
+    query_ends, key_ends = resolve_packed_sequence_lengths(
+        {**kwargs, "actual_seq_len": actual_seq_len}, total, total,
     )
-    if previous != global_tokens or total != expected_total:
-        raise ValueError(
-            f"global {kind} sequence boundaries cover {previous} tokens, "
-            f"expected {global_tokens}; CP-local projection contains {total} "
-            f"tokens, expected {expected_total}"
-        )
-    return torch.tensor(cumulative, dtype=torch.int32)
+    if query_ends is None:
+        query_ends = [(row + 1) * local_seq_len * cp_size for row in range(batch_size)]
+        key_ends = query_ends
+    if tuple(query_ends) != tuple(key_ends):
+        raise ValueError("DSA CP self-attention requires identical global Q/K document boundaries")
+    return dsa_document_plan(tuple(query_ends), batch_size, local_seq_len, cp_size, cp_rank)
 
 
-def _resolve_cp_sequence_lengths(
-    actual_seq_len: torch.Tensor | Sequence[int] | None,
-    kwargs: dict[str, Any],
-    *,
-    batch_size: int,
-    local_seq_len: int,
-    cp_size: int,
-    cp_rank: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Resolve aliases and produce CP-local cumulative Q and KV lengths."""
-    global_seq_len = local_seq_len * cp_size
-    global_tokens = batch_size * global_seq_len
-    packed_kwargs = dict(kwargs)
-    packed_kwargs["actual_seq_len"] = actual_seq_len
-    query_lengths, key_lengths = resolve_packed_sequence_lengths(
-        packed_kwargs,
-        global_tokens,
-        global_tokens,
+def _apply_worker_query_rope(query, embeddings, rope_head_dim, interleaved):
+    """Use the owner rotary convention without computing an unused companion key."""
+    if embeddings is None:
+        return query
+    # Optional NPU dependency; CPU planning does not execute worker projections.
+    from torch_npu import npu_rotary_mul  # pylint: disable=import-outside-toplevel
+
+    cos, sin = embeddings
+    if cos.ndim == 2:
+        cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
+    rotary, passthrough = query.split((rope_head_dim, query.shape[-1] - rope_head_dim), dim=-1)
+    if interleaved:
+        cos = cos[..., :rope_head_dim // 2].repeat_interleave(2, dim=-1).transpose(0, 1)
+        sin = sin[..., :rope_head_dim // 2].repeat_interleave(2, dim=-1).transpose(0, 1)
+        return _apply_interleaved_rope(rotary, passthrough, cos, sin, 2)
+    rotated = npu_rotary_mul(rotary.clone(), cos.unsqueeze(2), sin.unsqueeze(2), rotary_mode="half")
+    return torch.cat((rotated, passthrough), dim=-1)
+
+
+@torch.no_grad()
+def _worker_index_query(module, query_residual, embeddings, owner_rows):
+    """Retain the owner's GEMM row shape before testing discrete selector parity."""
+    projected = []
+    for chunk in query_residual.split(owner_rows, dim=1):
+        padded = torch.nn.functional.pad(chunk, (0, 0, 0, owner_rows - chunk.shape[1]))
+        projected.append(module.indexer.wq_b(padded)[:, :chunk.shape[1]])
+    query = projected[0] if len(projected) == 1 else torch.cat(projected, dim=1)
+    query = query.view(
+        1, query_residual.shape[1], module.num_index_heads, module.index_head_dim,
     )
-    if query_lengths is None:
-        query_lengths = [
-            (row + 1) * global_seq_len
-            for row in range(batch_size)
-        ]
-        key_lengths = list(query_lengths)
-    if len(query_lengths) != len(key_lengths):
-        raise ValueError(
-            "DeepSeek-V3.2 DSA requires the same number of packed query and "
-            "KV sequences for CP"
-        )
+    return _apply_worker_query_rope(
+        query, embeddings, module.qk_rope_head_dim, module.index_rotary_interleaved,
+    )
 
-    query_cp = _cp_local_sequence_lengths(
-        query_lengths,
-        batch_size=batch_size,
-        local_seq_len=local_seq_len,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        kind="query",
-    ).to(device=device)
-    key_cp = _cp_local_sequence_lengths(
-        key_lengths,
-        batch_size=batch_size,
-        local_seq_len=local_seq_len,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        kind="KV",
-    ).to(device=device)
-    return query_cp, key_cp
+
+@torch.no_grad()
+def _prepare_worker_query(module, exchange, apply_rope):
+    """Consume worker inputs and project Q independently of the Index K transfer."""
+    qr, weights, cos, sin = exchange.wait()
+    query = None
+    if exchange.route.query_count:
+        query = _worker_index_query(module, qr, (cos, sin) if apply_rope else None, exchange.owner_queries)
+    return query, weights
+
+
+@torch.no_grad()
+def _launch_worker_selection(module, exchange, selection_key, key_plan, worker_inputs):
+    """Run LI after its K dependency and return document-local IDs to Q owners."""
+    query, weights = worker_inputs
+    if not exchange.route.query_count:
+        selected = torch.empty((0, module.index_topk), device=weights.device, dtype=torch.int32)
+    else:
+        segments = exchange.route.segments
+        if key_plan is not None:
+            segments = key_plan.map_segments(segments)
+        key, q_ends, k_ends = pack_selection_prefixes(selection_key, segments)
+        lengths = tuple(torch.tensor(ends, device=query.device, dtype=torch.int32) for ends in (q_ends, k_ends))
+        selected = dsa_indexer(
+            query, key, weights, *lengths, module.index_topk, backend="cann", host_lengths=(q_ends, k_ends),
+        )[0][:, 0]
+    return exchange.launch_result(selected)
+
+
+def _launch_selection_inputs(module, qr, weights, embeddings, plan, cp_mesh, options):
+    """Submit the optional no-grad worker input before the KV bank collectives."""
+    if options["indexer_load_balance"] == "none":
+        return None
+    if embeddings is None:
+        shape = (1, qr.shape[1], module.qk_rope_head_dim)
+        embeddings = (qr.new_ones(shape), qr.new_zeros(shape))
+    else:
+        embeddings = tuple(value.unsqueeze(0) if value.ndim == 2 else value for value in embeddings)
+    return launch_indexer_inputs(
+        qr, weights, embeddings, plan.lengths, 1, options["indexer_load_balance"], cp_mesh.get_group(),
+        options["indexer_balance_block_size"], options["indexer_zigzag_min_length"],
+    )
+
+
+def _launch_cp_banks(index_key, kv_nope, k_rot, plan, cp_mesh, options):
+    """Launch Index K first, then main KV, retaining independent gradient routes."""
+    group, size, rank = cp_mesh.get_group(), cp_mesh.size(), cp_mesh.get_local_rank()
+    key_plan = None
+    if options["index_k_comm"] == "all_to_all_v":
+        key_plan = index_key_plan(
+            plan.lengths, size, rank, 1, options["indexer_load_balance"],
+            options["indexer_balance_block_size"], options["indexer_zigzag_min_length"],
+        )
+        index_pending = async_sequence_dispatch(index_key, 1, key_plan.dispatch, group, gradient=key_plan.gradient)
+    else:
+        index_pending = async_cp_allgather_launch(index_key, 1, cp_mesh)
+    if options["main_kv_comm"] == "all_to_all_v":
+        route = document_prefix_route((0, *accumulate(plan.lengths)), index_key.shape[1], size, rank, 1)
+        kv_pending = async_sequence_dispatch(kv_nope, 1, route, group)
+        rope_pending = async_sequence_dispatch(k_rot, 1, route, group)
+    else:
+        kv_pending = async_cp_allgather_launch(kv_nope, 1, cp_mesh)
+        rope_pending = async_cp_allgather_launch(k_rot, 1, cp_mesh)
+    return key_plan, index_pending, kv_pending, rope_pending
 
 
 def _validate_cp_target(target_module: nn.Module, cp_mesh: Any) -> None:
@@ -198,6 +201,16 @@ def _validate_cp_target(target_module: nn.Module, cp_mesh: Any) -> None:
         )
 
 
+def _validate_cp_stage(batch_size, use_dense, options):
+    """Restrict sparse worker scheduling and packed-only routes explicitly."""
+    mode = options["indexer_load_balance"]
+    if use_dense and mode != "none":
+        raise ValueError("DSA Indexer load balance redistributes sparse TopK only; dense warmup requires mode='none'")
+    if batch_size != 1 and (mode != "none" or options["main_kv_comm"] != "all_gather"
+                           or options["index_k_comm"] != "all_gather"):
+        raise ValueError("DSA query balance and document-prefix all_to_all_v require packed batch size one")
+
+
 def _run_cp_dsa_kernels(
     module: nn.Module,
     index_states: tuple[torch.Tensor, ...],
@@ -205,24 +218,27 @@ def _run_cp_dsa_kernels(
     sequence_lengths: tuple[torch.Tensor, torch.Tensor],
     *,
     use_dense: bool,
+    selected: torch.Tensor | None = None,
+    host_lengths: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
 ) -> torch.Tensor:
     """Run the selected sparse or dense DSA CANN path."""
     index_query, index_key, merge_weight = index_states
     absorbed_query, kv_nope, q_rot, k_rot = attention_states
     actual_q_len, actual_kv_len = sequence_lengths
     if use_dense:
-        return _deepseek_v32_dense_attention(module, index_states, attention_states, sequence_lengths)
+        return _deepseek_v32_dense_attention(
+            module, index_states, attention_states, sequence_lengths, host_lengths=host_lengths,
+        )
 
-    topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd = dsa_indexer(  # pylint: disable=not-callable
-        index_query,
-        index_key,
-        merge_weight,
-        actual_q_len,
-        actual_kv_len,
-        module.index_topk,
-        backend="cann",
+    if selected is None:
+        selected, *_ = dsa_indexer(
+            index_query, index_key, merge_weight, actual_q_len, actual_kv_len, module.index_topk, backend="cann",
+        )
+    index_query_tnd, index_key_tnd, merge_weight_tnd = (
+        tensor.flatten(0, 1) for tensor in index_states
     )
-    attn_output, softmax_max, softmax_sum = dsa_sparse_attention(  # pylint: disable=not-callable
+    topk_indices = selected
+    attn_output, softmax_max, softmax_sum = dsa_sparse_attention(
         absorbed_query,
         kv_nope,
         q_rot,
@@ -232,15 +248,16 @@ def _run_cp_dsa_kernels(
         actual_q_len,
         actual_kv_len,
         backend="cann",
+        pad_output=False,
     )
+    loss_lengths = sequence_lengths if host_lengths is None else host_lengths
     return module._apply_auxiliary_loss(  # pylint: disable=protected-access
         attn_output,
         (index_query_tnd, index_key_tnd, merge_weight_tnd),
         attention_states,
         topk_indices,
         (softmax_max, softmax_sum),
-        actual_q_len,
-        actual_kv_len,
+        *loss_lengths,
     )
 
 
@@ -255,7 +272,7 @@ def _deepseek_v32_dsa_cp_forward(
     use_dense: bool | None = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, None]:
-    """Run one DeepSeek DSA layer with all-gathered causal KV prefixes."""
+    """Run DSA with owner learning, optional selection workers and causal KV routes."""
     del attention_mask
     if hidden_states.ndim != 3:
         raise ValueError(
@@ -268,6 +285,9 @@ def _deepseek_v32_dsa_cp_forward(
     cp_size = cp_mesh.size()
     cp_rank = cp_mesh.get_local_rank()
     use_dense = bool(module.dsa_dense_warm_up) if use_dense is None else use_dense
+    options = module._hp_deepseek_v32_dsa_cp_config  # pylint: disable=protected-access
+    _validate_cp_stage(batch_size, use_dense, options)
+    plan = _resolve_cp_document_plan(actual_seq_len, kwargs, batch_size, local_seq_len, cp_size, cp_rank)
     module._validate_forward_inputs(  # pylint: disable=protected-access
         hidden_states,
         None,
@@ -291,35 +311,50 @@ def _deepseek_v32_dsa_cp_forward(
         position_embeddings,
     )
 
-    # Launch all three independent gathers before waiting so packed-length
-    # conversion overlaps with communication on the NPU stream.
-    index_key_gather = async_cp_allgather_launch(index_key, 1, cp_mesh)
-    kv_nope_gather = async_cp_allgather_launch(kv_nope, 1, cp_mesh)
-    k_rot_gather = async_cp_allgather_launch(k_rot, 1, cp_mesh)
-    actual_q_len, actual_kv_len = _resolve_cp_sequence_lengths(
-        actual_seq_len,
-        kwargs,
-        batch_size=batch_size,
-        local_seq_len=local_seq_len,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        device=hidden_states.device,
+    exchange = _launch_selection_inputs(
+        module, q_resid, merge_weight, position_embeddings, plan, cp_mesh, options,
     )
+    key_plan, index_key_gather, kv_nope_gather, k_rot_gather = _launch_cp_banks(
+        index_key, kv_nope, k_rot, plan, cp_mesh, options,
+    )
+    sequence_lengths = plan.sequence_lengths(hidden_states.device)
 
-    prefix_len = (cp_rank + 1) * local_seq_len
-    gathered_index_key = index_key_gather.wait()
-    gathered_kv_nope = kv_nope_gather.wait()
-    gathered_k_rot = k_rot_gather.wait()
-    index_key = gathered_index_key[:, :prefix_len].contiguous()
-    kv_nope = gathered_kv_nope[:, :prefix_len].contiguous()
-    k_rot = gathered_k_rot[:, :prefix_len].contiguous()
+    # Projection depends only on qr and RoPE inputs, so it can cover pending bank
+    # communication. Collective launch order is identical on every CP rank.
+    worker_inputs = None
+    if exchange is not None:
+        worker_inputs = _prepare_worker_query(module, exchange, position_embeddings is not None)
+    if key_plan is None:
+        selection_key = index_key_gather.wait()
+        index_key = plan.key(selection_key)
+    else:
+        selection_key, index_key = index_key_gather.wait_with_gradient()
+    index_query = index_query.flatten(0, 1).unsqueeze(0)
+    merge_weight = merge_weight.flatten(0, 1).unsqueeze(0)
+    selected = None
+    if exchange is not None:
+        pending_topk = _launch_worker_selection(
+            module, exchange, selection_key.detach(), key_plan, worker_inputs,
+        )
+    elif not use_dense:
+        selected = dsa_indexer(
+            index_query, index_key, merge_weight, *sequence_lengths, module.index_topk, backend="cann",
+            host_lengths=(plan.query_ends, plan.key_ends),
+        )[0]
+
+    # Main-bank waits occur after selection. A pending TopK return owns its buffers
+    # until consumed; it cannot bypass an earlier collective on the same CP group.
+    kv_nope, k_rot = kv_nope_gather.wait(), k_rot_gather.wait()
+    if options["main_kv_comm"] == "all_gather":
+        kv_nope, k_rot = plan.key(kv_nope), plan.key(k_rot)
+    if exchange is not None:
+        selected = pending_topk.wait().unsqueeze(1)
+    attention_states = (absorbed_query.flatten(0, 1).unsqueeze(0), kv_nope,
+                        q_rot.flatten(0, 1).unsqueeze(0), k_rot)
     attn_output = _run_cp_dsa_kernels(
-        module,
-        (index_query, index_key, merge_weight),
-        (absorbed_query, kv_nope, q_rot, k_rot),
-        (actual_q_len, actual_kv_len),
-        use_dense=use_dense,
-    )
+        module, (index_query, index_key, merge_weight), attention_states, sequence_lengths,
+        use_dense=use_dense, selected=selected, host_lengths=(plan.query_ends, plan.key_ends),
+    ).view(batch_size, local_seq_len, module.num_heads, -1)
     if use_dense:
         return module.o_proj(attn_output.flatten(2)), None
     value_up_weight = kv_weight[:, module.qk_nope_head_dim :].transpose(1, 2)
@@ -343,6 +378,11 @@ def deepseek_v32_dsa_attention_cp_wrapper(
     cp_mesh: Any,
     ep_mesh: Any,
     dense_warmup: bool | None = None,
+    indexer_load_balance: str = "none",
+    indexer_balance_block_size: int | None = None,
+    indexer_zigzag_min_length: int | None = None,
+    main_kv_comm: str = "all_gather",
+    index_k_comm: str = "all_gather",
 ) -> _ForwardRewriteRequest:
     """Install CP and follow the source DSA dense-warm-up state by default.
 
@@ -351,8 +391,18 @@ def deepseek_v32_dsa_attention_cp_wrapper(
     code can switch between dense warm-up and sparse DSA without reinstalling
     the wrapper. Set it to ``true`` or ``false`` in the recipe only to force a
     path for the whole run; leave it ``null`` to follow the model's stage flag.
+
+    Sparse selection can use none/zigzag/greedy/hybrid. Dense warmup requires
+    none: its fused dense KL learns from every visible key, not TopK workers.
+    Both stages can independently select all_gather or all_to_all_v for main
+    and Index K banks. The latter and balancing require packed batch size one.
     """
     del mesh, tp_mesh, ep_mesh
+    block = resolve_indexer_balance_block_size(indexer_load_balance, indexer_balance_block_size)
+    validate_indexer_hybrid_threshold(indexer_load_balance, indexer_zigzag_min_length)
+    for name, value in (("main_kv_comm", main_kv_comm), ("index_k_comm", index_k_comm)):
+        if value not in ("all_gather", "all_to_all_v"):
+            raise ValueError(f"{name} must be 'all_gather' or 'all_to_all_v'")
     _validate_cp_target(target_module, cp_mesh)
     original_forward = target_module.forward
 
@@ -387,6 +437,11 @@ def deepseek_v32_dsa_attention_cp_wrapper(
             "_hp_deepseek_v32_dsa_cp_config": {
                 "cp_size": cp_mesh.size(),
                 "dense_warmup_override": dense_warmup,
+                "indexer_load_balance": indexer_load_balance,
+                "indexer_balance_block_size": block,
+                "indexer_zigzag_min_length": indexer_zigzag_min_length,
+                "main_kv_comm": main_kv_comm,
+                "index_k_comm": index_k_comm,
             },
             "_hp_deepseek_v32_dsa_cp_dense_warmup": dense_warmup,
         },

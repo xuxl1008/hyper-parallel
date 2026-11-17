@@ -14,12 +14,14 @@
 # ============================================================================
 """CPU coverage for the CANN DSA sparse-attention autograd adapter."""
 
+import sys
 import unittest
-from unittest.mock import Mock
+from types import ModuleType
+from unittest.mock import Mock, patch
 
 import torch
 
-from hyper_parallel.components.functional.dsa_sparse_attention import _cann_sparse_attention
+from hyper_parallel.components.functional.dsa_sparse_attention import _cann_sparse_attention, dsa_sparse_attention
 
 
 class TestSparseAttentionAutograd(unittest.TestCase):
@@ -62,3 +64,45 @@ class TestSparseAttentionAutograd(unittest.TestCase):
         grad_loader.assert_called_once_with()
         torch.testing.assert_close(query.grad, expected_dq)
         torch.testing.assert_close(key.grad, expected_dkv)
+
+    def test_unpadded_output_preserves_values_and_projection_gradient(self):
+        """
+        Feature: Optional unpadded sparse-attention output.
+        Description: Consume value channels with a noncontiguous projection gradient.
+        Expectation: Both output modes retain input gradients and native value width.
+        """
+        query = torch.randn(1, 3, 2, 4, requires_grad=True)
+        key = torch.randn(1, 5, 1, 4, requires_grad=True)
+        query_rope = torch.randn(1, 3, 2, 2, requires_grad=True)
+        key_rope = torch.randn(1, 5, 1, 2, requires_grad=True)
+        seed = torch.randn(1, 2, 3, 4).transpose(1, 2)
+        backend = ModuleType("torch_npu")
+        backend.npu_sparse_flash_attention = Mock(side_effect=lambda q, *_args, **_kwargs: (
+            q.clone(), torch.zeros(1), torch.ones(1),
+        ))
+
+        def native_backward(q, k, _value, _indices, gradient, output, *_args, **_kwargs):
+            """Check the gradient layout and value-only native output contract."""
+            self.assertEqual(output.shape[-1], 4)
+            self.assertTrue(gradient.is_contiguous())
+            return (gradient.clone(), torch.ones_like(k), None,
+                    torch.ones_like(q[..., :2]), torch.ones_like(k[..., :2]), None)
+
+        outputs, gradients = [], []
+        with patch.dict(sys.modules, {"torch_npu": backend}), patch(
+            "hyper_parallel.components.functional.dsa_sparse_attention._load_sparse_attention_grad",
+            return_value=native_backward,
+        ):
+            for padded in (True, False):
+                output, _, _ = dsa_sparse_attention(
+                    query, key, query_rope, key_rope, torch.zeros(3, 1, 2, dtype=torch.int32),
+                    0.5, torch.tensor([3]), torch.tensor([5]), pad_output=padded,
+                )
+                self.assertEqual(output.shape[-1], 6 if padded else 4)
+                if padded:
+                    self.assertEqual(torch.count_nonzero(output[..., 4:]).item(), 0)
+                outputs.append(output[..., :4].detach())
+                gradients.append(torch.autograd.grad(output[..., :4], (query, key, query_rope, key_rope), seed))
+        torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+        for old, new in zip(*gradients):
+            torch.testing.assert_close(old, new, atol=0, rtol=0)

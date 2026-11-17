@@ -62,6 +62,13 @@ plan_overrides:
         _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
         # null follows dsa_dense_warm_up; true/false forces one path for the full run.
         dense_warmup: null
+        # Sparse selection only. Dense warmup requires none.
+        indexer_load_balance: none
+        # greedy/hybrid accept indexer_balance_block_size (default 2048).
+        # hybrid also requires indexer_zigzag_min_length in raw tokens.
+        # Prefix all_to_all_v and query balancing require packed batch size 1.
+        main_kv_comm: all_gather
+        index_k_comm: all_gather
 
 mixed_precision:
   enabled: false
@@ -110,7 +117,11 @@ dataloader:
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
-    attention_mode: dense
+    # DSA consumes cumulative boundaries, not the generic dense attention mask.
+    attention_mode: compressed
+    reset_position_ids: true
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.deepseek_v32.adapter.data.runtime.DeepseekV32Runtime
   sampler_type: single
   data_rearrange_map: null
   data_sharding: false

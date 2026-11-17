@@ -43,12 +43,12 @@ models/deepseek_v32/
   `model.norm` 换成融合 `RMSNorm`；`*.self_attn` 换成 `DeepseekV32DSAAttention`，indexer 与稀疏 attention 走
   CANN 融合算子；`*.mlp.experts` 换成 `GroupedExperts`。
 - **并行**：FSDP、TP（含 loss parallel）、CP、EP。不支持 PP 和 sequence parallel。
-- **训练行为**与 Transformers 实现一致：
+- **训练行为**：
   - router 用 `e_score_correction_bias` 选专家（sigmoid 分数、分组 top-k），bias 保持初始值；
   - 没有负载均衡 loss；
   - 官方 checkpoint 的 MTP 层（第 61 层）加载时被忽略，不训练；
-  - 不训练 indexer，因为它的输出只用于不可导的 top-k 选择。
-- **数据**：每行是一条因果序列。DSA 不读取 `attention_mask` 的内容，不支持 padding mask、dropout 和 KV cache。
+  - TopK 选择本身不可导；启用 `dsa_loss_coeff` 且未冻结 Indexer 时，通过辅助 KL 训练 Indexer。
+- **数据**：支持连续因果序列，以及通过累计文档边界隔离的 packed 序列。DSA 不读取 `attention_mask` 的内容，不支持任意 padding mask、dropout 和 KV cache。
 
 ## 环境要求
 
@@ -136,3 +136,46 @@ bash hyper_parallel/models/deepseek_v32/recipes/run_parallel_offline.sh \
 ```
 
 日志、数据缓存和 checkpoint 写到 `output/deepseek_v32`，可用 `OUTPUT_DIR` 修改。
+
+## DSA 的文档级 CP 与 Indexer 选择均衡
+
+`train.yaml` 通过 `DeepseekV32Runtime` 将全局 `cu_seq_lens` 转为 `actual_seq_len`，
+CP 只切 token，不切全局文档边界。每层共用缓存的文档计划，仅打包拥有本地 Q 的文档及其因果 K 前缀。
+原生 LI、SFA 和 KL 使用一致的 TND 文档顺序与文档内 TopK 坐标。
+数据侧 `attention_mode: compressed` 表示传递紧凑边界而不构造 dense mask，**不表示 DSA 压缩 token**。
+`reset_position_ids: true` 让 RoPE 使用文档内位置；位置与文档隔离由不同字段表达。
+
+在现有 `*.self_attn.forward` 的 CP replacement 中配置：
+
+```yaml
+implementation:
+  _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
+  dense_warmup: null
+  indexer_load_balance: greedy
+  indexer_balance_block_size: 2048
+  main_kv_comm: all_to_all_v
+  index_k_comm: all_to_all_v
+```
+
+- `none`：维持原 Q owner；`zigzag`：文档首尾片段配对、余数均分；`greedy`：按可见 Q×K 工作量分配块；
+  `hybrid`：长文档主体 zigzag，余数和短文档统一 greedy。
+- `indexer_balance_block_size` 仅用于 greedy/hybrid，省略时为 2048；none/zigzag 不接受此参数。
+  hybrid 还需显式设置 `indexer_zigzag_min_length`，单位为原始文档 token 数。
+- 两种 KV 通信分别可选 `all_gather`（默认）或 `all_to_all_v`。均衡和前缀 A2AV 要求 packed batch size 为 1；
+  原始序列仍按 CP 等长切分，单篇文档无需被 CP 大小整除。
+- 均衡只迁移不求导的选择任务：发送 qr、weights、cos/sin，worker 重投影 Index Q 并返回 TopK。
+  主 attention、teacher/KL 及可微 Index Q/K/weights 留在原 Q owner；不会自动均衡这些模块的计算。
+- Index K 的前向需求是 worker 选择与 owner KL 前缀的并集，反向仅回传 owner KL 贡献。
+  半精度 Index K 梯度在源 owner 用 FP32 累加再转换回输入 dtype；不承诺与 BF16 AG/RS 逐位相同。
+- worker 收到 qr 后可在 Index K 传输期间做投影；每个原生消费者读取通信结果前仍显式 wait。
+  通信事件包含等待其他 rank 的时间，异步提交并不保证整层加速。
+
+Dense warmup 保留基础 CP 和两种 KV 通信，要求 `indexer_load_balance: none`。
+选择均衡是可选实验项，默认不启用；收益取决于文档分布、LI 占比及额外分发/返回成本。
+BF16 打分接近 TopK 分界时，重排后的 native 调用可能产生不同选择，应分别检查同输入精度和训练轨迹。
+CE 的 ignore label 不会自动排除 Indexer KL 的 padding Q；不要将任意 padding mask 支持视为本改动的能力。
+
+## 算子与调度实验草稿
+
+可选的算子侧补丁、worker partial-RoPE及eager反向调度原型见
+[实验说明](../../../examples/torch/dsa/README.md)。它们需要显式运行，不默认启用，也不是Trainer配置项。

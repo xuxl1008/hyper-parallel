@@ -29,12 +29,10 @@ from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.functional import aggregate_hidden, aux_loss_auto_scale
 from hyper_parallel.components.functional import apply_rotary_pos_emb, apply_rotary_pos_emb_interleave
-from hyper_parallel.components.functional import (
-    dsa_indexer,
-    dsa_kl_loss,
-    dsa_sparse_attention,
-    dsa_sparse_attention_rescale,
-)
+from hyper_parallel.components.functional import dsa_sparse_attention_rescale
+from hyper_parallel.components.functional.dsa_indexer import dsa_indexer
+from hyper_parallel.components.functional.dsa_kl_loss import dsa_kl_loss
+from hyper_parallel.components.functional.dsa_sparse_attention import dsa_sparse_attention
 from hyper_parallel.components.functional.npu_fusion_attention import resolve_packed_sequence_lengths
 
 
@@ -43,12 +41,14 @@ def _dense_flash_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    sequence_lengths: tuple[torch.Tensor, torch.Tensor],
+    sequence_lengths: tuple[torch.Tensor, torch.Tensor] | tuple[tuple[int, ...], tuple[int, ...]],
     *,
     need_stats: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Run one TND FA and return dense-indexer statistics."""
-    query_ends, key_ends = (lengths.tolist() for lengths in sequence_lengths)
+    query_ends, key_ends = (
+        lengths.tolist() if isinstance(lengths, torch.Tensor) else lengths for lengths in sequence_lengths
+    )
     q_flat, k_flat, v_flat = (tensor.flatten(0, 1) for tensor in (query, key, value))
     num_heads = q_flat.shape[1]
     causal_mask = torch.ones((2048, 2048), dtype=torch.bool, device=query.device).triu(diagonal=1)
@@ -86,6 +86,8 @@ def _deepseek_v32_dense_attention(
     index_states: tuple[torch.Tensor, ...],
     attention_states: tuple[torch.Tensor, ...],
     sequence_lengths: tuple[torch.Tensor, torch.Tensor],
+    *,
+    host_lengths: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
 ) -> torch.Tensor:
     """Run unabsorbed MLA FA and the fused dense indexer KL on local states."""
     query, compressed_kv, query_rope, key_rope = attention_states
@@ -95,9 +97,10 @@ def _deepseek_v32_dense_attention(
     key, value = projected_kv.split((module.qk_nope_head_dim, module.v_head_dim), dim=-1)
     key_rope = key_rope.expand(-1, -1, module.num_heads, -1)
     need_stats = bool(module.training and not module.freeze_dsa and module.dsa_loss_coeff)
+    runtime_lengths = sequence_lengths if host_lengths is None else host_lengths
     output, maximum, total = _dense_flash_attention(
         module, torch.cat((query, query_rope), dim=-1), torch.cat((key, key_rope), dim=-1),
-        value, sequence_lengths, need_stats=need_stats,
+        value, runtime_lengths, need_stats=need_stats,
     )
     if need_stats:
         # Dense CANN operators are optional for sparse and Omni execution.
@@ -108,7 +111,7 @@ def _deepseek_v32_dense_attention(
         )
         # pylint: enable=import-outside-toplevel
 
-        query_lengths, key_lengths = sequence_lengths
+        query_lengths, key_lengths = runtime_lengths
         index_query, index_key, weights = (tensor.flatten(0, 1) for tensor in index_states)
         indexer_stats = dsa_dense_indexer_lse(
             index_query, index_key, weights, query_lengths=query_lengths, key_lengths=key_lengths,
@@ -220,7 +223,8 @@ def _restore_attention_projection(
     value_head_dim: int,
 ) -> torch.Tensor:
     """Apply the absorbed value up-projection and restore the hidden layout."""
-    output = output[..., :kv_lora_rank]
+    if output.shape[-1] != kv_lora_rank:
+        output = output[..., :kv_lora_rank]
     output = output.permute(2, 0, 1, 3).reshape(num_heads, batch_size * seq_length, kv_lora_rank)
     output = torch.bmm(output, value_up_weight)
     return output.view(num_heads, batch_size, seq_length, value_head_dim).permute(1, 2, 0, 3).reshape(
@@ -516,8 +520,8 @@ class DeepseekV32DSAAttention(nn.Module):
         attention_states: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         topk_indices: torch.Tensor,
         softmax_stats: tuple[torch.Tensor, torch.Tensor],
-        actual_q_len: torch.Tensor,
-        actual_kv_len: torch.Tensor,
+        actual_q_len: torch.Tensor | tuple[int, ...],
+        actual_kv_len: torch.Tensor | tuple[int, ...],
     ) -> torch.Tensor:
         """Attach the DSA KL auxiliary loss when training enables it."""
         if not (self.training and not self.freeze_dsa and self.dsa_loss_coeff):

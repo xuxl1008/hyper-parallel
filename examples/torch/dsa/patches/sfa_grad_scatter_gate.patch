@@ -1,0 +1,30 @@
+--- a/attention/sparse_flash_attention_grad/op_host/arch22/sparse_flash_attention_grad_tiling_bs1_basic.cpp
++++ b/attention/sparse_flash_attention_grad/op_host/arch22/sparse_flash_attention_grad_tiling_bs1_basic.cpp
+@@ -16,6 +16,8 @@
+ #include "sparse_flash_attention_grad_tiling_bs1_basic.h"
+ #include "op_host/tiling_templates_registry.h"
+ #include <algorithm>
++#include <cstdlib>
++#include <cstring>
+
+ namespace optiling {
+ namespace sfag {
+@@ -55,6 +57,18 @@
+     }
+     if (s1 <= 0 || s2 <= 0 || selectedBlockCount <= 0 || selectedBlockSize <= 0) {
+         decision.reason = "disabled: invalid s1/s2/selected block count/selected block size";
++        return decision;
++    }
++    // Diagnostic only: change host dispatch without changing the device kernel.
++    const char *scatterOverride = std::getenv("DSA_SFAG_SCATTER_OVERRIDE");
++    if (scatterOverride != nullptr && std::strcmp(scatterOverride, "off") == 0) {
++        decision.reason = "diagnostic: scatter disabled";
++        return decision;
++    }
++    if (scatterOverride != nullptr && std::strcmp(scatterOverride, "on") == 0 &&
++        n1 > 0 && n1 <= 128 && selectedBlockSize == 1) {
++        decision.enabled = true;
++        decision.reason = "diagnostic: scatter enabled";
+         return decision;
+     }
+     if (n1 <= 0 || n1 >= 128) {

@@ -23,11 +23,13 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from heapq import heapify, heappop, heappush
 from itertools import accumulate
 from typing import Any
+
+import numpy as np
 
 import torch
 import torch.distributed as dist
@@ -336,16 +338,28 @@ def _zigzag_send_ranges(lengths: tuple[int, ...], size: int, rank: int, boundari
 
 @dataclass(frozen=True)
 class IndexerRoute:
-    """Device-independent row ordering and matching variable collective splits."""
+    """Immutable interval ordering and collective splits, without per-token Python IDs."""
 
     segments: tuple
     input_splits: tuple[int, ...]
     output_splits: tuple[int, ...]
-    send_rows: tuple[int, ...]
-    receive_rows: tuple[int, ...]
-    local_sources: tuple[int, ...]
-    local_targets: tuple[int, ...]
+    send_ranges: tuple[tuple[int, int], ...]
+    receive_ranges: tuple[tuple[int, int], ...]
+    local_source_ranges: tuple[tuple[int, int], ...]
+    local_target_ranges: tuple[tuple[int, int], ...]
     query_count: int
+    _cached_hash: int = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Hash immutable metadata once; equality still checks every routing field."""
+        object.__setattr__(self, "_cached_hash", hash((
+            self.segments, self.input_splits, self.output_splits, self.send_ranges,
+            self.receive_ranges, self.local_source_ranges, self.local_target_ranges, self.query_count,
+        )))
+
+    def __hash__(self) -> int:
+        """Avoid rescanning a long route on each device-index cache lookup."""
+        return self._cached_hash
 
 
 @lru_cache(maxsize=128)
@@ -389,29 +403,57 @@ def _route_from_tasks(assignments: tuple, lengths: tuple[int, ...], rank: int, r
     return _route_from_ranges(assignments[rank], lengths, rank, ratio, sends, receives)
 
 
+def _merge_ranges(ranges: Iterator[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    """Coalesce consecutive IDs without reordering their collective payload positions."""
+    merged = []
+    for start, count in ranges:
+        if not count:
+            continue
+        if merged and merged[-1][0] + merged[-1][1] == start:
+            previous, length = merged[-1]
+            merged[-1] = (previous, length + count)
+        else:
+            merged.append((start, count))
+    return tuple(merged)
+
+
 def _route_from_ranges(tasks: tuple, lengths: tuple[int, ...], rank: int, ratio: int,
                        sends: tuple, receives: tuple) -> IndexerRoute:
-    """Preserve peer ordering and local bypass for either task-planning path."""
-    send_rows, receive_rows, inputs, outputs = [], [], [], []
-    for peer, sent in enumerate(sends):
-        sent = sent if peer != rank else ()
-        received = receives[peer] if peer != rank else ()
-        inputs.append(sum(count for _, count in sent))
-        outputs.append(sum(count for _, _, count in received))
-        send_rows.extend(row for start, count in sent for row in range(start, start + count))
-        receive_rows.extend(row for _, start, count in received for row in range(start, start + count))
-    sources = tuple(row for start, _, count in receives[rank] for row in range(start, start + count))
-    targets = tuple(row for _, start, count in receives[rank] for row in range(start, start + count))
-    return IndexerRoute(_segments(tasks, lengths, ratio), tuple(inputs), tuple(outputs),
-                        tuple(send_rows), tuple(receive_rows), sources, targets,
+    """Preserve peer ordering and local bypass for either task-planning path.
+
+    Merging storage intervals does not merge attention documents or change peer
+    splits. Each index vector retains exactly the original row order.
+    """
+    inputs = tuple(sum(count for _, count in sent) if peer != rank else 0
+                   for peer, sent in enumerate(sends))
+    outputs = tuple(sum(count for _, _, count in received) if peer != rank else 0
+                    for peer, received in enumerate(receives))
+    sent = _merge_ranges(item for peer, ranges in enumerate(sends) if peer != rank for item in ranges)
+    received = _merge_ranges((start, count) for peer, ranges in enumerate(receives) if peer != rank
+                             for _, start, count in ranges)
+    sources = _merge_ranges((start, count) for start, _, count in receives[rank])
+    targets = _merge_ranges((start, count) for _, start, count in receives[rank])
+    return IndexerRoute(_segments(tasks, lengths, ratio), inputs, outputs, sent, received, sources, targets,
                         sum(task.length for task in tasks))
+
+
+def _range_rows(ranges: tuple[tuple[int, int], ...]) -> torch.Tensor:
+    """Expand CPU-only routing metadata in bulk, without Python objects per token."""
+    if not ranges:
+        return torch.empty(0, dtype=torch.long)
+    intervals = np.asarray(ranges, dtype=np.int64)
+    counts = intervals[:, 1]
+    offsets = np.cumsum(counts) - counts
+    rows = np.repeat(intervals[:, 0] - offsets, counts)
+    rows += np.arange(rows.size, dtype=np.int64)
+    return torch.from_numpy(rows)
 
 
 @lru_cache(maxsize=32)
 @torch.inference_mode(False)
 def _device_rows(route: IndexerRoute, device: torch.device) -> tuple:
-    return tuple(torch.tensor(rows, device=device, dtype=torch.long) for rows in
-                 (route.send_rows, route.receive_rows, route.local_sources, route.local_targets))
+    return tuple(_range_rows(ranges).to(device=device) for ranges in
+                 (route.send_ranges, route.receive_ranges, route.local_source_ranges, route.local_target_ranges))
 
 
 def _exchange_rows(tensor: torch.Tensor, route: IndexerRoute, group: Any, rows: tuple) -> torch.Tensor:
@@ -438,8 +480,8 @@ def _exchange_inputs(inputs: tuple[torch.Tensor, ...], route: IndexerRoute, grou
         widths = [inputs[index].shape[-1] for index in indices]
         packed = torch.cat([inputs[index][0] for index in indices], dim=-1)
         received = _exchange_rows(packed, route, group, rows)
-        for index, field in zip(indices, received.split(widths, dim=-1)):
-            outputs[index] = field.unsqueeze(0).contiguous()
+        for index, value in zip(indices, received.split(widths, dim=-1)):
+            outputs[index] = value.unsqueeze(0).contiguous()
     return tuple(outputs)
 
 

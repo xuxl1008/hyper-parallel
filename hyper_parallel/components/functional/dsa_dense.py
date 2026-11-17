@@ -25,8 +25,8 @@ def _dense_indexer_lse(
     query_index: torch.Tensor,
     key_index: torch.Tensor,
     weights: torch.Tensor,
-    query_lengths: torch.Tensor | None,
-    key_lengths: torch.Tensor | None,
+    query_lengths: torch.Tensor | tuple[int, ...] | None,
+    key_lengths: torch.Tensor | tuple[int, ...] | None,
     layout: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return native indexer maximum and exponential sum, without gradients."""
@@ -38,8 +38,8 @@ def _dense_indexer_lse(
     with torch.no_grad():
         return npu_dense_lightning_indexer_softmax_lse(
             query_index.contiguous(), key_index.contiguous(), weights.contiguous(),
-            actual_seq_qlen=None if query_lengths is None else query_lengths.tolist(),
-            actual_seq_klen=None if key_lengths is None else key_lengths.tolist(),
+            actual_seq_qlen=query_lengths.tolist() if isinstance(query_lengths, torch.Tensor) else query_lengths,
+            actual_seq_klen=key_lengths.tolist() if isinstance(key_lengths, torch.Tensor) else key_lengths,
             layout=layout, sparse_mode=3,
         )
 
@@ -49,14 +49,15 @@ def dsa_dense_indexer_lse(
     index_key: torch.Tensor,
     head_weights: torch.Tensor,
     *,
-    query_lengths: torch.Tensor | None = None,
-    key_lengths: torch.Tensor | None = None,
+    query_lengths: torch.Tensor | tuple[int, ...] | None = None,
+    key_lengths: torch.Tensor | tuple[int, ...] | None = None,
     layout: str = "TND",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return detached FP32 indexer max/sum for fused dense KL.
 
     TND lengths are cumulative document ends without a leading zero; BSND
-    lengths are per-batch valid lengths. TND requires both length tensors.
+    lengths are per-batch valid lengths. Matching host tuples avoid reading device
+    lengths back to the host. TND requires both query and key lengths.
     The two outputs are maximum and exponential sum, rather than logsumexp.
     """
     return _dense_indexer_lse(
@@ -81,14 +82,14 @@ class _DenseIndexerKLLoss(torch.autograd.Function):
         scale: float,
         query_rope: torch.Tensor | None,
         key_rope: torch.Tensor | None,
-        query_lengths: torch.Tensor | None,
-        key_lengths: torch.Tensor | None,
+        query_lengths: torch.Tensor | tuple[int, ...] | None,
+        key_lengths: torch.Tensor | tuple[int, ...] | None,
         layout: str,
         loss_coefficient: float,
     ) -> torch.Tensor:
         """Compute summed KL in CANN and retain token-mean indexer gradients."""
-        query_ends = None if query_lengths is None else query_lengths.tolist()
-        key_ends = None if key_lengths is None else key_lengths.tolist()
+        query_ends = query_lengths.tolist() if isinstance(query_lengths, torch.Tensor) else query_lengths
+        key_ends = key_lengths.tolist() if isinstance(key_lengths, torch.Tensor) else key_lengths
         token_count = index_query.shape[0] if layout == "TND" else (
             index_query.shape[0] * index_query.shape[1] if query_ends is None else sum(query_ends)
         )
@@ -143,8 +144,8 @@ def dsa_dense_indexer_kl_loss(
     scale: float,
     query_rope: torch.Tensor | None = None,
     key_rope: torch.Tensor | None = None,
-    query_lengths: torch.Tensor | None = None,
-    key_lengths: torch.Tensor | None = None,
+    query_lengths: torch.Tensor | tuple[int, ...] | None = None,
+    key_lengths: torch.Tensor | tuple[int, ...] | None = None,
     layout: str = "TND",
     loss_coefficient: float = 1.0,
 ) -> torch.Tensor:

@@ -38,11 +38,15 @@ class TestDSAIndexer(unittest.TestCase):
         weights = torch.randn(1, 3, 2)
         indices = torch.zeros(3, 1, 2, dtype=torch.int32)
         ops = ModuleType("cann_ops_transformer.ops")
-        ops.lightning_indexer = Mock(return_value=(indices, None))
+        indexer = Mock(return_value=(indices, None))
+        ops.lightning_indexer = indexer
         metadata = torch.zeros(1024, dtype=torch.int32)
-        ops.lightning_indexer_metadata = Mock(return_value=metadata)
+        metadata_op = Mock(return_value=metadata)
+        ops.lightning_indexer_metadata = metadata_op
         package = ModuleType("cann_ops_transformer")
         package.ops = ops
+        package.lightning_indexer = indexer
+        package.lightning_indexer_metadata = metadata_op
         with patch.dict(sys.modules, {"cann_ops_transformer": package, "cann_ops_transformer.ops": ops}):
             actual = dsa_indexer(
                 query,
@@ -55,11 +59,11 @@ class TestDSAIndexer(unittest.TestCase):
 
         self.assertIs(actual[0], indices)
         self.assertEqual([tensor.shape for tensor in actual[1:]], [(3, 2, 4), (4, 1, 4), (3, 2)])
-        kwargs = ops.lightning_indexer.call_args.kwargs
+        kwargs = indexer.call_args.kwargs
         self.assertEqual(kwargs["layout_q"], "TND")
         self.assertEqual(kwargs["mask_mode"], 3)
         self.assertIs(kwargs["metadata"], metadata)
-        options = ops.lightning_indexer_metadata.call_args.kwargs
+        options = metadata_op.call_args.kwargs
         self.assertEqual(options["max_seqlen_q"], 2)
         self.assertEqual(options["max_seqlen_k"], 2)
         torch.testing.assert_close(kwargs["cu_seqlens_q"], torch.tensor([0, 2, 3], dtype=torch.int32))

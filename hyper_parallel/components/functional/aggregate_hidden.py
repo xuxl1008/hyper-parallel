@@ -17,7 +17,6 @@
 from typing import Any, Tuple
 
 import torch
-import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
 
 
 class _AggregateHidden(torch.autograd.Function):
@@ -31,6 +30,9 @@ class _AggregateHidden(torch.autograd.Function):
         mask: torch.Tensor,
     ) -> torch.Tensor:
         """Run the aggregate-hidden forward operator."""
+        # Register legacy custom operators only when this optional path executes.
+        import omni_training_custom_ops  # noqa: F401  # pylint: disable=import-outside-toplevel,unused-import
+
         ctx.save_for_backward(input_tensor, weight, mask)
         return torch.ops.custom.npu_aggregate_hidden(input_tensor, weight, mask=mask)
 

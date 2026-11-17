@@ -14,6 +14,8 @@
 # ============================================================================
 """DSA sparse-attention function."""
 
+from __future__ import annotations
+
 from typing import Any, Tuple
 
 import torch
@@ -27,7 +29,7 @@ logger = get_logger()
 
 def _load_sparse_attention_grad():
     """Defer the optional NPU dependency until sparse-attention backward."""
-    from cann_ops_transformer.ops import sparse_flash_attention_grad  # pylint: disable=import-outside-toplevel
+    from cann_ops_transformer import sparse_flash_attention_grad  # pylint: disable=import-outside-toplevel
 
     return sparse_flash_attention_grad
 
@@ -172,6 +174,22 @@ def _cann_sparse_attention(
     )
 
 
+class _ContiguousOutputGradient(torch.autograd.Function):
+    """Release projection-layout gradients before allocating native attention workspace."""
+
+    @staticmethod
+    def forward(ctx: Any, output: torch.Tensor) -> torch.Tensor:
+        """Preserve the output storage and numerical value."""
+        del ctx
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor]:
+        """Normalize the gradient in its own node so its source can be released early."""
+        del ctx
+        return (gradient.contiguous(),)
+
+
 def dsa_sparse_attention(
     query_nope: torch.Tensor,
     compressed_kv: torch.Tensor,
@@ -183,6 +201,7 @@ def dsa_sparse_attention(
     actual_seq_kvlen: torch.Tensor,
     *,
     backend: str = "cann",
+    pad_output: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute NPU DSA sparse flash attention without parameter-sink rescaling.
 
@@ -196,12 +215,15 @@ def dsa_sparse_attention(
         actual_seq_qlen: Cumulative query lengths as an int32 NPU tensor.
         actual_seq_kvlen: Cumulative key lengths as an int32 NPU tensor.
         backend: ``"cann"`` (default) or the legacy ``"omni"`` backend.
+        pad_output: Retain the historical zero RoPE-width output tail. Disable
+            when the consumer uses only the compressed-KV value channels.
 
     Returns:
         Attention output in BSND layout, followed by the softmax maximum and
         sum required by :func:`dsa_kl_loss`. The output head dimension contains
         the compressed-KV dimension followed by zero padding for the RoPE
-        dimension required by the sparse-attention backward operator.
+        dimension when ``pad_output=True``. Native backward consumes the
+        unpadded output internally and does not require this public tail.
     """
     if backend not in ("cann", "omni"):
         raise ValueError(f"backend must be 'cann' or 'omni', got {backend!r}")
@@ -253,7 +275,11 @@ def dsa_sparse_attention(
             return_softmax_lse=True,
         )
     # pylint: enable=import-outside-toplevel
-    if query_rope.size(-1) > 0:
+    if pad_output and query_rope.size(-1) > 0:
         output = F.pad(output, [0, query_rope.size(-1)])
+    if backend == "cann" and not pad_output:
+        # Output projection can return a head-major gradient. Copying it inside
+        # native backward keeps both layouts live alongside the large workspace.
+        output = _ContiguousOutputGradient.apply(output)
     output = rearrange(output, "(b s) n d -> b s n d", b=query_nope.shape[0])
     return output, softmax_max, softmax_sum

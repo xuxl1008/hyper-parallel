@@ -1,0 +1,7 @@
+{
+  "source_repository": "https://gitcode.com/cann/ops-transformer",
+  "file": "attention/sparse_flash_attention_grad/op_host/arch22/sparse_flash_attention_grad_tiling_bs1_basic.cpp",
+  "sha256_before_patch": "66c3c2ba567e750a1f850f8f05250b4bbdb08c0852a405a7329f455a08b72c79",
+  "note": "The experiment used a source export without Git metadata. Verify this file hash and git apply --check; no upstream commit identity is claimed.",
+  "change": "Host dispatch only; deterministic gate remains authoritative; no binary included."
+}

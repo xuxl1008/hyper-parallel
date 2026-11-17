@@ -43,14 +43,13 @@ models/deepseek_v32/
   `*.post_attention_layernorm` and `model.norm` use the fused `RMSNorm`; `*.self_attn` uses `DeepseekV32DSAAttention`,
   which runs the indexer and the sparse attention through CANN fused operators; `*.mlp.experts` uses `GroupedExperts`.
 - **Parallelism**: FSDP, TP (with loss parallelism), CP and EP. PP and sequence parallelism are not supported.
-- **Training behavior** follows the Transformers implementation:
+- **Training behavior**:
   - the router selects experts with `e_score_correction_bias` (sigmoid scores, group-limited top-k), and the bias keeps
     its initial value;
   - there is no load-balancing loss;
   - the MTP layer (layer 61) of the released checkpoint is ignored and not trained;
-  - the indexer is not trained, because its output only feeds the non-differentiable top-k selection.
-- **Data**: each row is one causal sequence. DSA does not read the contents of `attention_mask`, and supports no padding
-  mask, dropout or KV cache.
+  - TopK selection is non-differentiable; the auxiliary KL trains the indexer when `dsa_loss_coeff` is enabled and the indexer is not frozen.
+- **Data**: continuous causal sequences and packed documents isolated by cumulative boundaries are supported. DSA does not read `attention_mask` contents and does not support arbitrary padding masks, dropout or KV caches.
 
 ## Requirements
 
@@ -139,3 +138,49 @@ bash hyper_parallel/models/deepseek_v32/recipes/run_parallel_offline.sh \
 ```
 
 The log, data cache and checkpoints go to `output/deepseek_v32` unless `OUTPUT_DIR` is set.
+
+## Document-aware CP and Indexer selection balancing
+
+`train.yaml` uses `DeepseekV32Runtime` to pass global `cu_seq_lens` as `actual_seq_len`.
+CP shards tokens while retaining the global document boundaries. Cached plans select active local-Q documents
+and their causal K prefixes, with the same TND document order and document-local TopK IDs for LI, SFA and KL.
+The batch setting `attention_mode: compressed` passes compact boundaries instead of a dense mask;
+it does **not** compress DSA tokens. `reset_position_ids: true` uses document-relative RoPE positions.
+
+Configure the existing `*.self_attn.forward` CP replacement as follows:
+
+```yaml
+implementation:
+  _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
+  dense_warmup: null
+  indexer_load_balance: greedy
+  indexer_balance_block_size: 2048
+  main_kv_comm: all_to_all_v
+  index_k_comm: all_to_all_v
+```
+
+- `none` keeps original Q owners; `zigzag` pairs document head/tail fragments and distributes remainders;
+  `greedy` assigns blocks by visible Q×K work; `hybrid` applies zigzag to long-document bodies and greedy to
+  remainders and short documents.
+- `indexer_balance_block_size` is only valid for greedy/hybrid and defaults to 2048 when omitted.
+  Hybrid also requires an explicit `indexer_zigzag_min_length`, measured in original document tokens.
+- Each KV communication option accepts `all_gather` (default) or `all_to_all_v`.
+  Balancing and prefix A2AV require packed batch size one and equal contiguous raw CP shards;
+  individual documents need not be divisible by the CP size.
+- Only no-grad selection moves: qr, weights and rotary coefficients go to workers, which project Index Q
+  and return TopK. Main attention, teacher/KL and differentiable index states remain on the original Q owners.
+- Index K forward dispatch covers the union of worker-selection and owner-KL prefixes. Its backward sends
+  only owner-KL contributions, accumulating half-precision contributions in FP32 before casting back.
+  Bitwise equality with BF16 AG/RS is not guaranteed.
+- Worker projection can run while Index K communication is pending; consumers still wait before reading
+  received tensors. Asynchronous launch alone does not guarantee an end-to-end speedup.
+
+Dense warmup supports basic CP and both KV transports, but requires `indexer_load_balance: none`.
+Selection balancing is opt-in: gains depend on document distribution, LI cost and dispatch/return overhead.
+Near a BF16 TopK cutoff, regrouped native calls can select different keys; validate both identical inputs
+and training trajectories. Ignored CE labels do not automatically exclude padding queries from Indexer KL.
+
+## Draft operator and scheduling experiments
+
+Optional, manual-only DSA operator patches and eager backward scheduling prototypes are described in
+[the experiment guide](../../../examples/torch/dsa/README.md). They are disabled by default and are not Trainer options.

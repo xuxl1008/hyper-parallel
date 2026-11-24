@@ -841,6 +841,7 @@ def chunk_kda(
     chunk_size: int = 64,
     backend: str = "eager",
     cu_seqlens: Optional[torch.Tensor | Sequence[int]] = None,
+    recompute_state: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Dispatch dense or packed KDA to the explicitly selected local backend.
 
@@ -862,6 +863,7 @@ def chunk_kda(
         chunk_size: Number of tokens in a recurrence chunk.
         backend: Explicit local operator implementation to dispatch.
         cu_seqlens: Cumulative document boundaries for packed tokens.
+        recompute_state: Opt into native local state recomputation instead of saving h/v_new.
     """
     if query.ndim == 3:
         output, final = chunk_kda(
@@ -869,9 +871,12 @@ def chunk_kda(
             a_log=a_log, dt_bias=dt_bias, scale=scale, initial_state=initial_state,
             output_final_state=output_final_state, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             use_gate_in_kernel=use_gate_in_kernel, use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
-            lower_bound=lower_bound, chunk_size=chunk_size, backend=backend, cu_seqlens=cu_seqlens)
+            lower_bound=lower_bound, chunk_size=chunk_size, backend=backend, cu_seqlens=cu_seqlens,
+            recompute_state=recompute_state)
         return output.squeeze(0), final
     backend = _normalize_kda_backend(backend)
+    if recompute_state and backend != "ascendc":
+        raise ValueError("recompute_state selects the Ascend C state cache policy only.")
     if backend == "eager":
         return torch_chunk_kda(
             query, key, value, gate, beta,
@@ -895,6 +900,7 @@ def chunk_kda(
             a_log=a_log.float() if a_log is not None else None,
             dt_bias=dt_bias.float() if dt_bias is not None else None,
             scale=scale, lower_bound=lower_bound, chunk_size=chunk_size, cu_seqlens=cu_seqlens,
+            recompute_state=recompute_state,
         )
         return output, None
     triton_a_log = a_log.float() if a_log is not None else None

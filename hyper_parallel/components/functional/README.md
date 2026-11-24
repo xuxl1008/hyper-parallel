@@ -217,19 +217,31 @@ PyTorch/torch-npu `2.10.0` at these source revisions:
 [fla-npu](https://github.com/flashserve/flash-linear-attention-npu), installed with
 matching Python bindings, stable launcher and native operator libraries.
 KDA and GDN use the same package and public `fla_npu.ops.ascendc` namespace.
-The shared qualification revision is unmodified source commit
-[`131fd3e937bd7607e372cf80c1022a80ed5fb853`](https://github.com/flashserve/flash-linear-attention-npu/commit/131fd3e937bd7607e372cf80c1022a80ed5fb853).
-A filtered build must include both model families and their required operators;
-a KDA-only wheel does not qualify GDN, even if the Python exports exist.
-Do not combine bindings or operator libraries from different revisions.
-Install the wheel appropriate to the target hardware and CANN environment using
-[the upstream installation guide](https://github.com/flashserve/flash-linear-attention-npu).
+Use the unmodified official
+[`v26.10.0-feature` release (`26.10.0+feature`)](https://github.com/flashserve/flash-linear-attention-npu/releases/tag/v26.10.0-feature),
+with the wheel matching the target hardware (`a2`, `a3` or `a5`) and host architecture.
+Install the Python bindings, stable launcher and bundled operator libraries together;
+do not combine source-commit builds, overlay patches or libraries from another release.
+For example, after downloading the A2/aarch64 asset into an environment with the
+compatible Torch/torch-npu/CANN runtime already installed:
+
+```bash
+python -m pip install --no-deps ./flash_linear_attention_npu_a2-26.10.0+feature-py3-none-manylinux_2_34_aarch64.whl
+```
+
+The release requires glibc 2.34 or later and GLIBCXX_3.4.29. For the Torch 2.10
+runtime, upstream recommends torch-npu 2.10.0.post2 or later because earlier builds
+lack GDN fixes. Follow the release's runtime compatibility matrix when choosing
+another Torch/CANN combination. A2 execution does not qualify A3/A5 performance
+or every hardware-specific option. The adapters check the required public APIs
+rather than branching on device names or requiring a source checkout.
 
 KDA local, Ulysses and state CP share `chunk_kda_fwd_prepare` save mode,
 `chunk_fwd_h`, `chunk_kda_fwd_finalize`, `chunk_kda_bwd_prepare`,
 `chunk_gated_delta_rule_bwd_dhu` and `chunk_kda_bwd_finalize`.
-The adapter owns raw-input gradients and converts sequence-major inputs to the
-head-major native stage layouts. Beta sigmoid backward uses Torch's
+The adapter owns raw-input gradients. Prepare consumes the original BSND inputs;
+its outputs retain the head-major layouts required by subsequent native stages.
+The saved V remains BSND and is converted only when backward consumes it. Beta sigmoid backward uses Torch's
 `aten.sigmoid_backward` with the FP32 `beta_eff` already saved by Prepare.
 The native finalize sigmoid-backward flag stays disabled on every device;
 the adapter does not inspect device names or require an FLA beta helper.
@@ -238,25 +250,44 @@ own hardware support; this common adapter does not imply every device has
 completed numerical or performance qualification.
 
 GDN requires `chunk_gated_delta_rule_fwd` and `chunk_gated_delta_rule_bwd` with
-`layout`, `cu_seqlens` and `chunk_indices`. Normalization and effective gate/beta
-remain in the caller's autograd graph. Both wrappers use per-invocation save
-mode and reject unsupported external state-gradient requests. KDA layer CP
-and GDN pure Ulysses use the same backend for causal convolution; Ascend C additionally requires
-`causal_conv1d` and `causal_conv1d_bwd` with the SiLU derivative included.
+`layout`, `cu_seqlens`, `chunk_indices`, and the native normalization/sigmoid
+backward auxiliaries. The GDN module passes compact grouped Q/K heads and
+activated beta. Native prepare/finalize own Q/K normalization; the module keeps
+the sigmoid outside because the fused variant increased saved memory without
+a measured speed benefit on the validated release. The scalar decay transform remains outside because the public
+composite API does not implement gate fusion. The functional entry still accepts
+effective beta by default; `use_beta_sigmoid_in_kernel=True` selects raw logits.
+GDN retains
+`g_cumsum` and `A` with `disable_recompute=True`; it does not request the optional
+per-chunk `h` output. Turning that flag off requires a paired recomputation path.
+The GDN framework adapter currently exposes local/pure Ulysses execution; native
+summary APIs do not by themselves enable GDN state P2P or AllGather.
+Convolution is selected independently with `conv_backend`; `conv_backend="ascendc"`
+requires `causal_conv1d` and `causal_conv1d_bwd` with the SiLU derivative included.
 
-KDA state P2P, AllGather, grouped AllGather/P2P and recursive doubling
+KDA state P2P, AllGather, sparse TND AllToAllV, grouped AllGather/P2P and recursive doubling
 additionally require native CP summary/merge APIs. RD shares the existing
 transport and reset planner while scanning native S/M forward and native G/N
 in reverse, without the Triton forward-transfer cache. The validated native
-base is the same shared revision above, built for the target device.
-This is a main-source build, not a claim that the
-`v26.9.1` release wheel exports the required CP/staged backward interfaces.
+package is the same official release above, which exports these staged and CP
+interfaces. No locally patched native package is required.
 The adapter converts backward-summary `gk` and local `dHT` to model dtype as
 required by its public ABI. Communication and summary apply remain FP32.
 These conversions introduce rounding relative to FP32-input extensions;
 no local native patches are required. Older releases without the independent
 stages or CP summary exports are not compatible with this path.
 These protocols share the same local KDA stages and can be combined with Ulysses.
+`state_cp_method="alltoallv"` collects only the current packed documents'
+relevant fragments, using the existing state group and compact merge buffers.
+Dense inputs use AllGather. This is an explicit choice: a document spanning the
+whole group still has linear worst-rank storage and may favor AllGather.
+
+KDA's optional `recompute_state=True` retains prepared U and the actual incoming
+state, then rebuilds local h/v_new during backward. It does not replay forward
+state communication or omit the backward gradient exchange. The default is
+False: it reduces forward residency but adds compute and can increase the
+single-invocation backward peak. An outer checkpoint around the whole CP
+module can still replay its communication.
 Forward exchanges use S/M, while backward produces fresh G/N instead of caching M.
 See [KDA context parallelism](../../../docs/guide/kda_context_parallel.md)
 for configurations, supported shapes and the state-buffer lifetime contract.

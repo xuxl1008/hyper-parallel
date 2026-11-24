@@ -79,13 +79,16 @@ class KimiDeltaAttentionModule(nn.Module):
 
     def __init__(self, *, config: Any = None, module: nn.Module | None = None,
                  backend: str = "eager", conv_backend: str | None = None,
-                 chunk_size: int = 64, input_layout: str = "BSH") -> None:
+                 chunk_size: int = 64, input_layout: str = "BSH", recompute_state: bool = False) -> None:
         """Construct local parameters or adopt source weights without renaming them."""
         super().__init__()
         if (config is None) == (module is None):
             raise ValueError("KDA requires exactly one of config or module")
         self.config = config if module is None else getattr(module, "config", None)
         self.backend = backend
+        self.recompute_state = recompute_state
+        if recompute_state and backend != "ascendc":
+            raise ValueError("recompute_state selects the Ascend C state cache policy only.")
         self.conv_backend = validate_conv_backend(backend if conv_backend is None else conv_backend)
         self.chunk_size = chunk_size
         self.input_layout = input_layout
@@ -307,7 +310,7 @@ class KimiDeltaAttentionModule(nn.Module):
                          initial_state=None, output_final_state=False, chunk_size=self.chunk_size,
                          use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
                          use_beta_sigmoid_in_kernel=True, lower_bound=self.lower_bound,
-                         backend=self.backend, cu_seqlens=offsets)[0]
+                         backend=self.backend, cu_seqlens=offsets, recompute_state=self.recompute_state)[0]
 
     def execute_attention_pipeline(self, hidden_states: torch.Tensor,
                                    info: PackedSequenceInfo | None) -> tuple:

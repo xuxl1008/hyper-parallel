@@ -36,7 +36,7 @@ from .kimi_delta_attention import KimiDeltaAttentionModule
 def _validate_kda_state_protocol(options: Any, cp: int, degree: int, backend: str) -> None:
     """Keep state protocol qualifications separate from layout validation."""
     protocol = options.get("state_cp_method", "p2p")
-    if protocol not in ("p2p", "allgather", "grouped_allgather_p2p", "recursive_doubling"):
+    if protocol not in ("p2p", "allgather", "alltoallv", "grouped_allgather_p2p", "recursive_doubling"):
         raise ValueError("Unknown KDA state_cp_method")
     group = options.get("allgather_group_size", 1)
     if (not isinstance(group, int) or isinstance(group, bool)) or group < 1 or (cp > 1 and (cp // degree) % group):
@@ -99,12 +99,12 @@ def _build_local(
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "", context: Any = None,
     backend: str = "eager", conv_backend: str | None = None, chunk_size: int = 64,
     input_layout: str = "BSH", ulysses_degree: int | None = 1,
-    state_cp_method: str = "p2p", allgather_group_size: int = 1,
+    state_cp_method: str = "p2p", allgather_group_size: int = 1, recompute_state: bool = False,
 ) -> nn.Module:
     """Keep CP selection in the family request, outside the standalone algorithm."""
     del module_fqn, context, ulysses_degree, state_cp_method, allgather_group_size
     return KimiDeltaAttentionModule(config=config, module=module, backend=backend, conv_backend=conv_backend,
-                                     chunk_size=chunk_size, input_layout=input_layout)
+                                     chunk_size=chunk_size, input_layout=input_layout, recompute_state=recompute_state)
 
 
 # Public factories follow the ModuleFamily class-style naming convention.
@@ -113,7 +113,7 @@ def KimiDeltaAttention(  # pylint: disable=invalid-name
     *, config: Any = None, module: nn.Module | None = None, module_fqn: str = "",
     context: Any = None, mesh: Any = None, backend: str = "eager", conv_backend: str | None = None,
     chunk_size: int = 64, input_layout: str = "BSH", ulysses_degree: int | None = 1,
-    state_cp_method: str = "p2p", allgather_group_size: int = 1,
+    state_cp_method: str = "p2p", allgather_group_size: int = 1, recompute_state: bool = False,
     hidden_size: int | None = None, num_heads: int = 32, num_v_heads: int | None = None,
     head_k_dim: int = 128, head_v_dim: int = 128, conv_kernel_size: int = 4,
     gate_lower_bound: float = -5.0, use_full_rank_gate: bool = True, rms_norm_eps: float = 1e-6,
@@ -132,8 +132,9 @@ def KimiDeltaAttention(  # pylint: disable=invalid-name
         chunk_size: Local chunk length; fused implementations require 64.
         input_layout: BSH or TH, determining the external token shard axis.
         ulysses_degree: Head-exchange degree; None selects pure Ulysses scheduling.
-        state_cp_method: Ordered state exchange: p2p, allgather, grouped_allgather_p2p or recursive_doubling.
+        state_cp_method: Ordered state exchange: p2p, allgather, alltoallv, grouped_allgather_p2p or recursive_doubling.
         allgather_group_size: Contiguous state-group width for grouped_allgather_p2p.
+        recompute_state: Rebuild native local h/v_new from the saved entry without replaying CP.
         hidden_size: Legacy direct-construction model width; exclusive with config and module.
         num_heads: Query/key head count for direct construction.
         num_v_heads: Value head count; defaults to num_heads.
@@ -155,7 +156,8 @@ def KimiDeltaAttention(  # pylint: disable=invalid-name
     return build_family(KimiDeltaAttention, config=config, module=module, module_fqn=module_fqn,
                         context=context, mesh=mesh, backend=backend, conv_backend=conv_backend,
                         chunk_size=chunk_size, input_layout=input_layout, ulysses_degree=ulysses_degree,
-                        state_cp_method=state_cp_method, allgather_group_size=allgather_group_size)
+                        state_cp_method=state_cp_method, allgather_group_size=allgather_group_size,
+                        recompute_state=recompute_state)
 
 
 register_module_family(ModuleFamily(

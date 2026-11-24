@@ -81,7 +81,7 @@ def prepare_kda_native(inputs: tuple[torch.Tensor, ...], scale: float, lower_bou
     """Prepare once for native summaries and the local state recurrence.
 
     Args:
-        inputs: Head-major Q/K/V, token-major raw gate/beta and FP32 A_log/dt_bias.
+        inputs: Token-major raw Q/K/V/gate/beta and FP32 A_log/dt_bias.
         scale: Attention output scale.
         lower_bound: Safe gate lower bound.
         metadata: Local cu_seqlens and chunk_indices, or empty for dense input.
@@ -92,8 +92,8 @@ def prepare_kda_native(inputs: tuple[torch.Tensor, ...], scale: float, lower_bou
     ops = load_kda_native_ops()
     query, key, value, gate, beta, a_log, dt_bias = inputs
     result = ops.chunk_kda_fwd_prepare(
-        query, key, value, gate.transpose(1, 2).contiguous(), beta.transpose(1, 2).contiguous(),
-        scale, layout="BNSD", chunk_size=64,
+        query, key, value, gate, beta,
+        scale, layout="BSND", chunk_size=64,
         safe_gate=True, lower_bound=lower_bound, use_gate_in_kernel=True,
         A_log=a_log, dt_bias=dt_bias.flatten(), epsilon=1e-6,
         use_qk_l2norm_in_kernel=True, use_beta_sigmoid_in_kernel=True,
@@ -114,6 +114,7 @@ def ascendc_chunk_kda(
     gate: torch.Tensor, beta: torch.Tensor, *, a_log: torch.Tensor,
     dt_bias: torch.Tensor, scale: float | None = None, lower_bound: float = -5.0,
     chunk_size: int = 64, cu_seqlens: Sequence[int] | torch.Tensor | None = None,
+    recompute_state: bool = False,
 ) -> torch.Tensor:
     """Run dense or packed KDA with native attention and paired raw-input gradients.
 
@@ -131,6 +132,7 @@ def ascendc_chunk_kda(
         cu_seqlens: Strictly increasing host offsets for packed inputs, including
             zero and T. Packed rank-four inputs require B=1. Documents need not
             be multiples of 64; zero-length documents are rejected.
+        recompute_state: Save U and the entry state, then rebuild h/v_new in backward.
 
     Returns:
         BF16 output with the query shape. External recurrent states and double
@@ -143,7 +145,7 @@ def ascendc_chunk_kda(
         return ascendc_chunk_kda(
             *(tensor.unsqueeze(0) for tensor in (query, key, value, gate, beta)),
             a_log=a_log, dt_bias=dt_bias, scale=scale, lower_bound=lower_bound,
-            chunk_size=chunk_size, cu_seqlens=cu_seqlens).squeeze(0)
+            chunk_size=chunk_size, cu_seqlens=cu_seqlens, recompute_state=recompute_state).squeeze(0)
     if query.ndim != 4:
         raise ValueError("KDA inputs must have shape [B,T,H,K] or packed [T,H,K].")
     if chunk_size != 64:
@@ -152,18 +154,18 @@ def ascendc_chunk_kda(
     if metadata and query.shape[0] != 1:
         raise ValueError("Packed Ascend C KDA requires B=1.")
     scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
-    tokens = tuple(tensor.transpose(1, 2).contiguous() for tensor in (query, key, value))
+    tokens = tuple(tensor.contiguous() for tensor in (query, key, value))
     # Gate/beta stay token-major for backward. Native operators validate their
     # dtype, shape and device; only adapter-owned layout/metadata checks live here.
     # Clone sliced parameters to give native tiling this shard's storage descriptor.
     return _AscendCKDAStages.apply(
         *tokens, gate.contiguous(), beta.contiguous(), a_log.reshape(-1).clone(),
-        dt_bias.reshape(-1, query.shape[-1]).clone(), scale, lower_bound, metadata)
+        dt_bias.reshape(-1, query.shape[-1]).clone(), scale, lower_bound, metadata, recompute_state)
 
 
 def finish_kda_native_forward(ctx: Any, inputs: tuple[torch.Tensor, ...], prepared: KDANativePrepared,
                               initial: torch.Tensor | None, scale: float, lower_bound: float,
-                              metadata: dict) -> torch.Tensor:
+                              metadata: dict, recompute_state: bool = False) -> torch.Tensor:
     """Apply the incoming state, finalize outputs and retain native save-mode tensors.
 
     Args:
@@ -174,6 +176,7 @@ def finish_kda_native_forward(ctx: Any, inputs: tuple[torch.Tensor, ...], prepar
         scale: Attention output scale.
         lower_bound: Safe gate lower bound retained for backward.
         metadata: Local packed indices, or an empty dense descriptor.
+        recompute_state: Rebuild h/v_new locally during backward without redoing CP.
     """
     ops = load_kda_native_ops()
     _, _, value, gate, _, a_log, dt_bias = inputs
@@ -182,12 +185,40 @@ def finish_kda_native_forward(ctx: Any, inputs: tuple[torch.Tensor, ...], prepar
         output_final_state=False, use_exp2=True, **metadata)
     output = ops.chunk_kda_fwd_finalize(
         prepared.qg_scaled, prepared.aqk, v_new, hidden, output_layout="BSND", **metadata)
-    prepared = prepared._replace(u=None, qg_scaled=None)
-    # Entry states are retained for the native local backward.
-    ctx.save_for_backward(value, gate, a_log, dt_bias, *prepared, hidden, v_new)
+    prepared = prepared._replace(u=prepared.u if recompute_state else None, qg_scaled=None)
+    entry = None
+    if recompute_state:
+        # Only the first fragment can depend on another rank. Clone its small
+        # entry, not a view retaining all packed documents' zero-state slots.
+        entry = initial
+        if initial is not None and metadata and initial.shape[0] > 1:
+            entry = initial[:1].clone()
+        hidden = v_new = None
+    ctx.save_for_backward(value, gate, a_log, dt_bias, *prepared, hidden, v_new, entry)
     ctx.dtypes = tuple(tensor.dtype for tensor in inputs)
     ctx.scale, ctx.lower_bound, ctx.native_metadata = scale, lower_bound, metadata
     return output
+
+
+def restore_kda_native_state(ctx: Any, saved_tensors: tuple) -> tuple:
+    """Rebuild only local h/v_new from the saved entry; never invoke a protocol.
+
+    Args:
+        ctx: Context holding the same document metadata as the original forward.
+        saved_tensors: Saved Prepare outputs, optional h/v_new, and the small entry.
+    """
+    if saved_tensors[-3] is not None:
+        return saved_tensors
+    prepared = KDANativePrepared(*saved_tensors[4:-3])
+    initial = saved_tensors[-1]
+    if initial is not None and ctx.native_metadata:
+        sequences = len(ctx.native_metadata["cu_seqlens"]) - 1
+        if sequences > 1:
+            initial = torch.cat((initial, initial.new_zeros((sequences - 1, *initial.shape[1:]))))
+    hidden, v_new, _ = load_kda_native_ops().chunk_fwd_h(
+        prepared.kg, prepared.w, prepared.u, gk=prepared.gk, initial_state=initial,
+        output_final_state=False, use_exp2=True, **ctx.native_metadata)
+    return (*saved_tensors[:-3], hidden, v_new, saved_tensors[-1])
 
 
 def prepare_kda_native_backward(ctx: Any, saved_tensors: tuple, grad_output: torch.Tensor) -> tuple:
@@ -202,8 +233,8 @@ def prepare_kda_native_backward(ctx: Any, saved_tensors: tuple, grad_output: tor
         Head-major dO and the native dAqk, local dV and raw dQ intermediates.
     """
     ops = load_kda_native_ops()
-    prepared = KDANativePrepared(*saved_tensors[4:-2])
-    hidden, v_new = saved_tensors[-2:]
+    prepared = KDANativePrepared(*saved_tensors[4:-3])
+    hidden, v_new = saved_tensors[-3:-1]
     packed = bool(ctx.native_metadata)
 
     grad = grad_output.transpose(1, 2).contiguous()
@@ -234,7 +265,8 @@ def finish_kda_native_backward(ctx: Any, saved_tensors: tuple, grad: torch.Tenso
     ops = load_kda_native_ops()
     value, gate, a_log, dt_bias, *saved = saved_tensors
     (gk, _, akk, weights, _, qg, kg, _, query, key,
-     query_rstd, key_rstd, beta, hidden, v_new) = saved
+     query_rstd, key_rstd, beta, hidden, v_new, _) = saved
+    value = value.transpose(1, 2).contiguous()
     packed = bool(ctx.native_metadata)
 
     hidden_grad, _, dv_scan = ops.chunk_gated_delta_rule_bwd_dhu(
@@ -257,7 +289,8 @@ def finish_kda_native_backward(ctx: Any, saved_tensors: tuple, grad: torch.Tenso
     # native epilogue selection, recomputing sigmoid, or retaining raw beta.
     dbeta = torch.ops.aten.sigmoid_backward.default(dbeta, beta)
     dbeta, dgate = dbeta.transpose(1, 2), dgate.transpose(1, 2)
-    gradients = (dq, dk, dv, dgate, dbeta, da_log, ddt_bias.reshape_as(dt_bias))
+    gradients = (dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2),
+                 dgate, dbeta, da_log, ddt_bias.reshape_as(dt_bias))
     return tuple(gradient.to(dtype) for gradient, dtype in zip(gradients, ctx.dtypes))
 
 
@@ -267,25 +300,26 @@ class _AscendCKDAStages(torch.autograd.Function):
     @staticmethod
     def forward(ctx: Any, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 gate: torch.Tensor, beta: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
-                scale: float, lower_bound: float, metadata: dict) -> torch.Tensor:
+                scale: float, lower_bound: float, metadata: dict, recompute_state: bool) -> torch.Tensor:
         """Prepare and execute a local sequence with a zero entry state.
 
         Args:
             ctx: Autograd context owned by this invocation.
-            query: Head-major raw queries.
-            key: Head-major raw keys.
-            value: Head-major values.
+            query: Token-major raw queries.
+            key: Token-major raw keys.
+            value: Token-major values.
             gate: Raw gate logits or output-gate values for this stage.
-            beta: Activated delta-rule update weights.
+            beta: Raw delta-rule sigmoid logits.
             a_log: FP32 logarithmic decay-rate parameters.
             dt_bias: FP32 per-channel decay bias.
             scale: Attention output scaling factor.
             lower_bound: Lower bound of the safe decay gate.
             metadata: Native packed-document offsets and chunk indices.
+            recompute_state: Retain U and entry state instead of h/v_new.
         """
         inputs = (query, key, value, gate, beta, a_log, dt_bias)
         prepared = prepare_kda_native(inputs, scale, lower_bound, metadata)
-        return finish_kda_native_forward(ctx, inputs, prepared, None, scale, lower_bound, metadata)
+        return finish_kda_native_forward(ctx, inputs, prepared, None, scale, lower_bound, metadata, recompute_state)
 
     @staticmethod
     @once_differentiable
@@ -297,7 +331,7 @@ class _AscendCKDAStages(torch.autograd.Function):
             grad_output: Gradient of the local output.
         """
         # Unpack once: non-reentrant checkpoint hooks consume saved tensors.
-        saved = ctx.saved_tensors
+        saved = restore_kda_native_state(ctx, ctx.saved_tensors)
         prepared = prepare_kda_native_backward(ctx, saved, grad_output)
         gradients = finish_kda_native_backward(ctx, saved, *prepared, None)
-        return (*gradients, None, None, None)
+        return (*gradients, None, None, None, None)

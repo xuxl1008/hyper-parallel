@@ -27,7 +27,7 @@ from hyper_parallel.components.modules.attention.linear_attention_utils.sequence
 from hyper_parallel.components.functional.kimi_delta_attention import apply_kda_state_summary
 from hyper_parallel.components.functional.kimi_delta_attention_ascendc import (
     load_kda_native_ops, prepare_kda_native,
-    finish_kda_native_forward, prepare_kda_native_backward, finish_kda_native_backward,
+    finish_kda_native_forward, prepare_kda_native_backward, finish_kda_native_backward, restore_kda_native_state,
 )
 
 
@@ -74,6 +74,9 @@ class _NativeStateExchange:
         self.block, self.local = divmod(self.rank, self.width)
         self.owner = self.block * self.width + self.width - 1
         self.is_rd = getattr(executor, "protocol", None) == "recursive_doubling"
+        self.sparse = None
+        if getattr(executor, "protocol", None) == "alltoallv" and info is not None:
+            self.sparse = executor.bind_sequence(info, state_shape=(1, heads, 128, 128))
         self.plans = (tuple(executor.directional_plan(info, local_length, reverse=reverse) for reverse in (False, True))
                       if self.is_rd else ())
 
@@ -110,12 +113,12 @@ class _NativeStateExchange:
         """Post reception before native prepare, independently of summary production.
 
         Args:
-            reference: Head-major input supplying the head count and device.
+            reference: Local input supplying the device.
             forward: Select the chronological communication direction.
         """
         if self.is_rd or self.width == self.size:
             return None, None
-        incoming = reference.new_zeros((1, reference.shape[1], 128, 128), dtype=torch.float32)
+        incoming = reference.new_zeros((1, self.heads, 128, 128), dtype=torch.float32)
         peer = self.peer(forward, receiving=True)
         handle = None
         if self.rank == self.owner and peer is not None:
@@ -149,6 +152,14 @@ class _NativeStateExchange:
             maps = None if packed is None else packed.reshape(1, self.heads, 128, 256)
             result = self.executor.scan_affine(maps, self.plans[not forward], state_shape, reverse=not forward)
             return result, None, None
+        if self.sparse is not None:
+            maps, rank = self.sparse.exchange_maps(packed.reshape(1, self.heads, 128, 256), forward)
+            maps = maps.squeeze(1)
+            incoming = maps.new_zeros((self.heads, 128, 128))
+            count = maps.shape[0] - 1
+            if count:
+                ops.merge_fwd_bwd_kernel(incoming, maps, count, rank, forward=forward)
+            return incoming.unsqueeze(0), None, None
         if self.width == self.size:
             maps = self.executor.gather_packed(packed.reshape(1, *packed.shape[-3:]))
             incoming = maps.new_zeros((maps.shape[1], 128, 128))
@@ -238,14 +249,14 @@ class _AscendCKDAState(torch.autograd.Function):
     def forward(ctx: Any, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 gate: torch.Tensor, beta: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
                 scale: float, lower_bound: float, metadata: dict,
-                exchange: _NativeStateExchange | None) -> torch.Tensor:
+                exchange: _NativeStateExchange | None, recompute_state: bool) -> torch.Tensor:
         """Share prepare with S/M and local FwdH, then release gathered maps.
 
         Args:
             ctx: Per-invocation autograd context.
-            query: Raw head-major queries.
-            key: Raw head-major keys.
-            value: Head-major values.
+            query: Raw token-major queries.
+            key: Raw token-major keys.
+            value: Token-major values.
             gate: Sequence-major gate logits.
             beta: Sequence-major beta logits.
             a_log: FP32 decay parameters.
@@ -254,6 +265,7 @@ class _AscendCKDAState(torch.autograd.Function):
             lower_bound: Safe-gate lower bound.
             metadata: Native packed offsets and chunk indices.
             exchange: Optional state protocol for this invocation.
+            recompute_state: Rebuild local h/v_new from the saved incoming state.
         """
         ops = _load_state_ops()
         inputs = (query, key, value, gate, beta, a_log, dt_bias)
@@ -262,7 +274,7 @@ class _AscendCKDAState(torch.autograd.Function):
         initial = send_handle = outgoing = head = suffix = None
         if exchange is not None:
             tail, head, prefix, suffix = _native_ag_intervals(
-                exchange.info, query.shape[2], exchange.rank, exchange.size)
+                exchange.info, query.shape[1], exchange.rank, exchange.size)
             maps = None
             if exchange.needs_summary(True):
                 maps = ops.pre_process_fwd_kernel_merged(
@@ -271,7 +283,8 @@ class _AscendCKDAState(torch.autograd.Function):
             del maps, reception
             if exchange.info is not None:
                 initial = exchange.info.first_state(initial)
-        output = finish_kda_native_forward(ctx, inputs, prepared, initial, scale, lower_bound, metadata)
+        output = finish_kda_native_forward(
+            ctx, inputs, prepared, initial, scale, lower_bound, metadata, recompute_state)
         if send_handle is not None:
             send_handle.wait()
         del outgoing
@@ -289,7 +302,7 @@ class _AscendCKDAState(torch.autograd.Function):
         """
         ops = _load_state_ops()
         # Share one unpack across phases, including checkpoint recomputation.
-        saved = ctx.saved_tensors
+        saved = restore_kda_native_state(ctx, ctx.saved_tensors)
         gk, weights, qg, kg, query = saved[4], saved[7], saved[9], saved[10], saved[12]
         reception = ctx.exchange.receive(query, False)
         grad, d_aqk, dv_local_head, dq_raw = prepare_kda_native_backward(ctx, saved, grad_output)
@@ -300,14 +313,14 @@ class _AscendCKDAState(torch.autograd.Function):
         if send_handle is not None:
             send_handle.wait()
         del outgoing
-        return (*gradients, None, None, None, None)
+        return (*gradients, None, None, None, None, None)
 
 
 def ascendc_state_kda(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
     gate: torch.Tensor, beta: torch.Tensor, *, a_log: torch.Tensor,
     dt_bias: torch.Tensor, state_cp: Any, cp_mesh: Any, sequence_info: Any = None,
-    scale: float | None = None, lower_bound: float = -5.0,
+    scale: float | None = None, lower_bound: float = -5.0, recompute_state: bool = False,
 ) -> torch.Tensor:
     """Run native KDA with P2P, AllGather, grouped AllGather/P2P, or RD.
 
@@ -324,6 +337,7 @@ def ascendc_state_kda(
         sequence_info: Packed interval metadata after any Ulysses redistribution.
         scale: Attention scale, default 1/sqrt(128).
         lower_bound: Safe gate lower bound.
+        recompute_state: Rebuild h/v_new locally; preserve both directions of state communication.
 
     Returns:
         Output with the query shape. Uses the unmodified native stage APIs:
@@ -339,8 +353,8 @@ def ascendc_state_kda(
         raise ValueError("Native KDA state CP requires matching Q/K/V/gate heads and beta [1,T,H].")
     metadata = local_chunk_metadata(None if sequence_info is None else sequence_info.local_offsets, query.shape[1])
     scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
-    tokens = tuple(tensor.transpose(1, 2).contiguous() for tensor in (query, key, value))
+    tokens = tuple(tensor.contiguous() for tensor in (query, key, value))
     exchange = _NativeStateExchange(cp_mesh, state_cp, sequence_info, query.shape[1], query.shape[2])
     return _AscendCKDAState.apply(
         *tokens, gate.contiguous(), beta.contiguous(), a_log.reshape(-1).clone(),
-        dt_bias.reshape(-1, query.shape[-1]).clone(), scale, lower_bound, metadata, exchange)
+        dt_bias.reshape(-1, query.shape[-1]).clone(), scale, lower_bound, metadata, exchange, recompute_state)
